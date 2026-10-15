@@ -1,18 +1,11 @@
 /**
- * QueryLocal Worker — 东财实时行情 / 分时（对齐原 QMT querylocal 接口）
+ * QueryLocal Worker — 东财实时行情 / 分时（抗限流版）
  *
- * GET  /querylocal?code=600519&type=price
- * GET  /querylocal?code=600519&type=intraday
- * GET  /api/querylocal?...（同上）
- * POST /querylocal  body: { "codes": ["600519","000001"], "type": "price"|"intraday" }
- * POST /api/querylocal  同上
- * GET  /health
- *
- * price 批量策略：
- *   1. ulist.np 分批（15 只/批，间隔 700ms）
- *   2. 整批为空 → 等待后整批重试 1 次
- *   3. 仍空或缺失过多 → 拆成 5 只小组再请求
- *   4. 仍缺失 → 单只低并发兜底
+ * 策略：
+ *  - price 批量：ulist.np，15/批，串行，批间隔 ~1.2s + 抖动
+ *  - 空批：长退避后同批仅重试 1 次，不拆批、不单只补全
+ *  - 成功结果写入 caches.default（15s 新鲜），重复请求优先命中
+ *  - 全程不并发打东财价格接口
  */
 
 const CORS = {
@@ -28,21 +21,21 @@ const EM_HEADERS = {
   Accept: "*/*",
 };
 
-// ---------- 价格批量参数 ----------
+// ---------- 抗限流参数 ----------
 const ULIST_BATCH_SIZE = 15;
-const ULIST_BATCH_DELAY_MS = 700;
-const ULIST_RETRY_DELAY_MS = 1000;
-const ULIST_RETRY_SPLIT = 5;
+const ULIST_BATCH_DELAY_MS = 1200;   // 批间隔基准
+const ULIST_EMPTY_BACKOFF_MS = 2500; // 空批退避
+const CACHE_FRESH_SECONDS = 15;      // 新鲜缓存
+const CACHE_STALE_SECONDS = 60;      // 过期仍可回退
 
-// 缺失代码单只兜底
-const FALLBACK_CONCURRENCY = 2;
-const FALLBACK_DELAY_MS = 350;
-
-// 分时批量
-const INTRADAY_CONCURRENCY = 3;
-const INTRADAY_DELAY_MS = 250;
+// 分时仍需单只，低速串行
+const INTRADAY_DELAY_MS = 400;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const jitter = (base, ratio = 0.2) => {
+  const d = base * ratio;
+  return Math.round(base - d + Math.random() * d * 2);
+};
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -56,7 +49,7 @@ function json(data, status = 200) {
 }
 
 // ==============================
-// 代码转换（港股 / A股 / 北交所）
+// 代码转换
 // ==============================
 function convertCode(code) {
   const codeUpper = String(code || "").toUpperCase().trim();
@@ -71,7 +64,6 @@ function convertCode(code) {
       pureCode: pure.padStart(5, "0"),
     };
   }
-
   if (/^\d{4,5}$/.test(codeUpper)) {
     return {
       secid: `116.${codeUpper.padStart(5, "0")}`,
@@ -80,7 +72,6 @@ function convertCode(code) {
       pureCode: codeUpper.padStart(5, "0"),
     };
   }
-
   if (/^(60|68|51|56|58|55|900)/.test(codeUpper)) {
     return {
       secid: `1.${codeUpper}`,
@@ -105,22 +96,21 @@ function convertCode(code) {
       pureCode: codeUpper.padStart(6, "0"),
     };
   }
-
   return null;
 }
 
-async function fetchJson(url, retries = 2, baseDelay = 350) {
+async function fetchJson(url, retries = 1, baseDelay = 400) {
   for (let i = 0; i <= retries; i++) {
     try {
       const r = await fetch(url, { headers: EM_HEADERS, cf: { cacheTtl: 0 } });
       if (!r.ok) {
-        console.log("http fail", r.status, url.slice(0, 140));
+        console.log("http fail", r.status, url.slice(0, 120));
       } else {
         const text = await r.text();
         try {
           return JSON.parse(text);
         } catch {
-          console.log("parse fail", text.slice(0, 200));
+          console.log("parse fail", text.slice(0, 160));
         }
       }
     } catch (e) {
@@ -173,11 +163,9 @@ function rowToPrice(row, item) {
 function matchRowToItem(row, pureToOrig) {
   if (!row || row.f12 == null) return null;
   const raw = String(row.f12);
-  const pure6 = raw.padStart(6, "0");
-  const pure5 = raw.padStart(5, "0");
   return (
-    pureToOrig[pure6] ||
-    pureToOrig[pure5] ||
+    pureToOrig[raw.padStart(6, "0")] ||
+    pureToOrig[raw.padStart(5, "0")] ||
     pureToOrig[raw] ||
     pureToOrig[String(Number(raw))] ||
     null
@@ -185,44 +173,73 @@ function matchRowToItem(row, pureToOrig) {
 }
 
 // ==============================
-// 单只价格
+// 价格缓存（Worker Cache API）
 // ==============================
-async function fetchPriceWithEastmoney(code) {
-  const info = convertCode(code);
-  if (!info) return null;
+function priceCacheKey(code) {
+  const key = String(code).trim();
+  return {
+    key,
+    request: new Request(`https://cache.internal/querylocal/price/${key}`, {
+      method: "GET",
+    }),
+  };
+}
 
+async function readPriceCache(code) {
   try {
-    const url = new URL("https://push2.eastmoney.com/api/qt/ulist.np/get");
-    url.searchParams.set("fltt", "2");
-    url.searchParams.set("secids", info.secid);
-    url.searchParams.set("fields", "f2,f3,f4,f12,f14,f18");
-    url.searchParams.set("_", String(Date.now()));
+    const { request } = priceCacheKey(code);
+    const hit = await caches.default.match(request);
+    if (!hit) return { fresh: null, stale: null };
+    const obj = await hit.json();
+    if (!obj || obj.latestPrice == null) return { fresh: null, stale: null };
+    const age = (Date.now() - (obj.cached_at || 0)) / 1000;
+    if (age <= CACHE_FRESH_SECONDS) return { fresh: obj, stale: null };
+    if (age <= CACHE_STALE_SECONDS) return { fresh: null, stale: obj };
+    return { fresh: null, stale: null };
+  } catch {
+    return { fresh: null, stale: null };
+  }
+}
 
-    const data = await fetchJson(url.toString());
-    const diff = data?.data?.diff;
-    const row = Array.isArray(diff) ? diff[0] : diff?.[info.secid];
-    if (!row) return null;
-    return rowToPrice(row, info);
+async function writePriceCache(code, price, ctx) {
+  if (!price || price.latestPrice == null) return;
+  try {
+    const { request } = priceCacheKey(code);
+    const body = JSON.stringify({ ...price, cached_at: Date.now() });
+    const resp = new Response(body, {
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": `max-age=${CACHE_STALE_SECONDS}`,
+      },
+    });
+    if (ctx && ctx.waitUntil) ctx.waitUntil(caches.default.put(request, resp.clone()));
+    else await caches.default.put(request, resp.clone());
   } catch (e) {
-    console.log("single price error:", e.message || e);
-    return null;
+    console.log("writePriceCache fail", e.message);
   }
 }
 
 // ==============================
-// 单批 ulist 请求
+// ulist 单批（不拆、不并发）
 // ==============================
+function pickPushHost() {
+  // 轻微轮换，降低单 host 被盯死的概率（不保证）
+  const n = 1 + Math.floor(Math.random() * 10);
+  return `https://${n}.push2.eastmoney.com`;
+}
+
 async function fetchOneUlistBatch(batch) {
   if (!batch.length) return {};
 
   const secids = batch.map((x) => x.secid).join(",");
-  const url = new URL("https://push2.eastmoney.com/api/qt/ulist.np/get");
+  const host = pickPushHost();
+  const url = new URL(`${host}/api/qt/ulist.np/get`);
   url.searchParams.set("fltt", "2");
   url.searchParams.set("secids", secids);
   url.searchParams.set("fields", "f2,f3,f4,f12,f14,f18");
   url.searchParams.set("_", String(Date.now()));
 
-  const data = await fetchJson(url.toString(), 1, 400);
+  const data = await fetchJson(url.toString(), 1, 500);
   const diff = data?.data?.diff;
 
   const pureToOrig = {};
@@ -247,108 +264,105 @@ async function fetchOneUlistBatch(batch) {
   return out;
 }
 
-async function runWithConcurrency(items, concurrency, delayMs, worker) {
-  const queue = items.slice();
-  const runners = Array.from(
-    { length: Math.min(concurrency, queue.length || 1) },
-    async () => {
-      while (queue.length) {
-        const item = queue.shift();
-        await worker(item);
-        if (delayMs > 0) await sleep(delayMs);
-      }
-    }
-  );
-  await Promise.all(runners);
+async function fetchPriceWithEastmoney(code) {
+  const info = convertCode(code);
+  if (!info) return null;
+  const map = await fetchOneUlistBatch([info]);
+  return map[code] || map[info.orig] || null;
 }
 
 /**
- * 处理一批：
- *  1) 正常请求
- *  2) 整批为空 → 等待后整批重试
- *  3) 仍空或缺失过多 → 拆成更小批再试
+ * 批量价格（抗限流核心）
+ *  - 先读缓存
+ *  - 仅对缺失代码串行 ulist 分批
+ *  - 空批：长退避后同批只重试 1 次，然后放弃（不拆、不单只）
  */
-async function processUlistBatch(batch, results, batchIndex, totalBatches) {
-  let gotMap = await fetchOneUlistBatch(batch);
-  let got = Object.keys(gotMap).length;
-
-  if (got === 0 && batch.length > 0) {
-    console.log(
-      `ulist batch ${batchIndex + 1}/${totalBatches} empty, retry after ${ULIST_RETRY_DELAY_MS}ms`
-    );
-    await sleep(ULIST_RETRY_DELAY_MS);
-    gotMap = await fetchOneUlistBatch(batch);
-    got = Object.keys(gotMap).length;
-  }
-
-  Object.assign(results, gotMap);
-
-  const stillMissing = batch.filter((x) => !results[x.code]);
-  if (
-    stillMissing.length > 0 &&
-    (got === 0 || stillMissing.length >= Math.ceil(batch.length * 0.5))
-  ) {
-    console.log(
-      `ulist batch ${batchIndex + 1} still missing ${stillMissing.length}, split to ${ULIST_RETRY_SPLIT}`
-    );
-    for (let i = 0; i < stillMissing.length; i += ULIST_RETRY_SPLIT) {
-      if (i > 0) await sleep(ULIST_BATCH_DELAY_MS);
-      const sub = stillMissing.slice(i, i + ULIST_RETRY_SPLIT);
-      const subMap = await fetchOneUlistBatch(sub);
-      Object.assign(results, subMap);
-      console.log(
-        `  split sub-batch got=${Object.keys(subMap).length}/${sub.length}`
-      );
-    }
-  }
-
-  const finalGot = batch.filter((x) => results[x.code]).length;
-  console.log(
-    `ulist price batch ${batchIndex + 1}/${totalBatches} req=${batch.length} finalGot=${finalGot}`
-  );
-}
-
-async function fetchPriceBatchUlist(codes) {
+async function fetchPriceBatchUlist(codes, ctx) {
   if (!codes.length) return {};
 
   const results = {};
-  const codeInfos = [];
-  for (const code of codes) {
-    const info = convertCode(code);
-    if (info) codeInfos.push({ code, ...info });
-  }
-  if (!codeInfos.length) return {};
+  const needFetch = [];
 
+  // 1) 缓存优先
+  await Promise.all(
+    codes.map(async (code) => {
+      const info = convertCode(code);
+      if (!info) return;
+      const { fresh, stale } = await readPriceCache(code);
+      if (fresh) {
+        const { cached_at, ...rest } = fresh;
+        results[code] = rest;
+      } else {
+        if (stale) {
+          // 先占位，后面若拉到新数据会覆盖
+          results[code] = { ...stale, _stale: true };
+        }
+        needFetch.push({ code, ...info });
+      }
+    })
+  );
+
+  if (!needFetch.length) {
+    // 去掉内部标记
+    for (const k of Object.keys(results)) {
+      if (results[k]._stale) {
+        const { _stale, cached_at, ...rest } = results[k];
+        results[k] = rest;
+      }
+    }
+    return results;
+  }
+
+  // 2) 串行分批
   const batches = [];
-  for (let i = 0; i < codeInfos.length; i += ULIST_BATCH_SIZE) {
-    batches.push(codeInfos.slice(i, i + ULIST_BATCH_SIZE));
+  for (let i = 0; i < needFetch.length; i += ULIST_BATCH_SIZE) {
+    batches.push(needFetch.slice(i, i + ULIST_BATCH_SIZE));
   }
 
   for (let bi = 0; bi < batches.length; bi++) {
-    if (bi > 0) await sleep(ULIST_BATCH_DELAY_MS);
-    await processUlistBatch(batches[bi], results, bi, batches.length);
+    if (bi > 0) await sleep(jitter(ULIST_BATCH_DELAY_MS));
+
+    const batch = batches[bi];
+    let gotMap = await fetchOneUlistBatch(batch);
+    let got = Object.keys(gotMap).length;
+
+    if (got === 0) {
+      console.log(
+        `ulist batch ${bi + 1}/${batches.length} empty, backoff ${ULIST_EMPTY_BACKOFF_MS}ms`
+      );
+      await sleep(jitter(ULIST_EMPTY_BACKOFF_MS));
+      gotMap = await fetchOneUlistBatch(batch);
+      got = Object.keys(gotMap).length;
+    }
+
+    for (const [code, price] of Object.entries(gotMap)) {
+      results[code] = price;
+      await writePriceCache(code, price, ctx);
+    }
+
+    console.log(
+      `ulist price batch ${bi + 1}/${batches.length} req=${batch.length} got=${got}`
+    );
+
+    // 若连续空批，额外多歇一会，避免整段被封
+    if (got === 0) {
+      await sleep(jitter(ULIST_EMPTY_BACKOFF_MS));
+    }
   }
 
-  // 仍缺失 → 单只兜底
-  const missing = codeInfos.map((x) => x.code).filter((c) => !results[c]);
-  if (missing.length) {
-    console.log(`fallback single for ${missing.length} codes`);
-    await runWithConcurrency(
-      missing,
-      FALLBACK_CONCURRENCY,
-      FALLBACK_DELAY_MS,
-      async (code) => {
-        const data = await fetchPriceWithEastmoney(code);
-        if (data) results[code] = data;
-      }
-    );
+  // 3) 清理 stale 标记：有新数据用新的，没有则保留 stale（有总比没有强）
+  for (const k of Object.keys(results)) {
+    if (results[k] && results[k]._stale) {
+      const { _stale, cached_at, ...rest } = results[k];
+      results[k] = rest;
+    }
   }
 
   return results;
 }
 
 // ==============================
-// 分时
+// 分时（串行，低速）
 // ==============================
 async function getEastmoneyIntraday(code) {
   const info = convertCode(code);
@@ -401,22 +415,18 @@ async function getEastmoneyIntraday(code) {
 
 async function fetchIntradayBatch(codes) {
   const results = {};
-  await runWithConcurrency(
-    codes,
-    INTRADAY_CONCURRENCY,
-    INTRADAY_DELAY_MS,
-    async (code) => {
-      const data = await getEastmoneyIntraday(code);
-      if (data) results[code] = data;
-    }
-  );
+  for (let i = 0; i < codes.length; i++) {
+    if (i > 0) await sleep(jitter(INTRADAY_DELAY_MS));
+    const data = await getEastmoneyIntraday(codes[i]);
+    if (data) results[codes[i]] = data;
+  }
   return results;
 }
 
 // ==============================
 // 路由
 // ==============================
-async function handleSingle(url) {
+async function handleSingle(url, ctx) {
   const code = url.searchParams.get("code");
   const type = url.searchParams.get("type");
 
@@ -427,10 +437,21 @@ async function handleSingle(url) {
 
   try {
     if (type === "price") {
+      const { fresh, stale } = await readPriceCache(code);
+      if (fresh) {
+        const { cached_at, ...rest } = fresh;
+        return json(rest);
+      }
       const result = await fetchPriceWithEastmoney(code);
-      return result
-        ? json(result)
-        : json({ detail: `Price data not found for ${code}` }, 404);
+      if (result) {
+        await writePriceCache(code, result, ctx);
+        return json(result);
+      }
+      if (stale) {
+        const { cached_at, ...rest } = stale;
+        return json(rest);
+      }
+      return json({ detail: `Price data not found for ${code}` }, 404);
     }
     if (type === "intraday") {
       const result = await getEastmoneyIntraday(code);
@@ -456,7 +477,7 @@ async function handleSingle(url) {
   }
 }
 
-async function handleBatch(request) {
+async function handleBatch(request, ctx) {
   let body;
   try {
     body = await request.json();
@@ -479,7 +500,7 @@ async function handleBatch(request) {
 
   try {
     if (type === "price") {
-      return json(await fetchPriceBatchUlist(validCodes));
+      return json(await fetchPriceBatchUlist(validCodes, ctx));
     }
     if (type === "intraday") {
       return json(await fetchIntradayBatch(validCodes));
@@ -509,8 +530,10 @@ export default {
           service: "eastmoney_querylocal_worker",
           timestamp: new Date().toISOString(),
           source: "eastmoney",
-          price_batch: "ulist.np + retry-split + single-fallback",
+          price_batch: "ulist.np serial + cache + backoff",
           batch_size: ULIST_BATCH_SIZE,
+          batch_delay_ms: ULIST_BATCH_DELAY_MS,
+          cache_fresh_s: CACHE_FRESH_SECONDS,
         });
       }
 
@@ -518,14 +541,14 @@ export default {
         (path === "/querylocal" || path === "/api/querylocal") &&
         request.method === "GET"
       ) {
-        return handleSingle(url);
+        return handleSingle(url, ctx);
       }
 
       if (
         (path === "/querylocal" || path === "/api/querylocal") &&
         request.method === "POST"
       ) {
-        return handleBatch(request);
+        return handleBatch(request, ctx);
       }
 
       return json({ detail: "not found", path }, 404);
