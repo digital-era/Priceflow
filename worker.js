@@ -9,6 +9,7 @@
  * GET  /health
  *
  * 返回格式与原 Flask 版完全一致，仅数据源改为东财。
+ * price 批量：使用 ulist.np 真正批量接口（每批 15 只 + 延迟）
  */
 
 const CORS = {
@@ -23,6 +24,14 @@ const EM_HEADERS = {
   Referer: "https://quote.eastmoney.com/",
   Accept: "*/*",
 };
+
+// 批量价格：ulist.np 每批数量与间隔（参考资金流 Worker 的稳定参数）
+const ULIST_BATCH_SIZE = 15;
+const ULIST_BATCH_DELAY_MS = 400;
+
+// 分时批量并发（分时接口本身是单只，只能并发控制）
+const INTRADAY_CONCURRENCY = 4;
+const INTRADAY_DELAY_MS = 200;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -50,8 +59,8 @@ function convertCode(code) {
     return {
       secid: `116.${pure}`,
       currency: "HKD",
-      scale: 1000,
       orig: code,
+      pureCode: pure.padStart(5, "0"),
     };
   }
 
@@ -60,21 +69,36 @@ function convertCode(code) {
     return {
       secid: `116.${codeUpper.padStart(5, "0")}`,
       currency: "HKD",
-      scale: 1000,
       orig: code,
+      pureCode: codeUpper.padStart(5, "0"),
     };
   }
 
   // A股 / 北交所
   if (/^(60|68|51|56|58|55|900)/.test(codeUpper)) {
-    return { secid: `1.${codeUpper}`, currency: "CNY", scale: 100, orig: code };
+    return {
+      secid: `1.${codeUpper}`,
+      currency: "CNY",
+      orig: code,
+      pureCode: codeUpper.padStart(6, "0"),
+    };
   }
   if (/^(00|30|15|200)/.test(codeUpper)) {
-    return { secid: `0.${codeUpper}`, currency: "CNY", scale: 100, orig: code };
+    return {
+      secid: `0.${codeUpper}`,
+      currency: "CNY",
+      orig: code,
+      pureCode: codeUpper.padStart(6, "0"),
+    };
   }
   if (/^[48]/.test(codeUpper)) {
-    // 北交所：东财通常用 0. 前缀（与深圳同一套）
-    return { secid: `0.${codeUpper}`, currency: "CNY", scale: 100, orig: code };
+    // 北交所
+    return {
+      secid: `0.${codeUpper}`,
+      currency: "CNY",
+      orig: code,
+      pureCode: codeUpper.padStart(6, "0"),
+    };
   }
 
   return null;
@@ -102,35 +126,59 @@ async function fetchJson(url, retries = 2, baseDelay = 300) {
   return null;
 }
 
+function num(v) {
+  if (v == null || v === "-" || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 // ==============================
-// 东财实时价格（完全对齐原返回结构）
+// 东财实时价格（单只，兼容旧逻辑）
 // ==============================
 async function fetchPriceWithEastmoney(code) {
   const info = convertCode(code);
   if (!info) return null;
 
   try {
-    const url = `https://push2.eastmoney.com/api/qt/stock/get?secid=${info.secid}&fields=f43,f58,f60&ut=fa5fd1943c7b386f172d6893dbfba10b`;
-    const json = await fetchJson(url);
-    const data = json?.data;
-    if (!data) return null;
+    // 优先用 ulist.np 单只（与批量同一套字段）
+    const url = new URL("https://push2.eastmoney.com/api/qt/ulist.np/get");
+    url.searchParams.set("fltt", "2");
+    url.searchParams.set("secids", info.secid);
+    url.searchParams.set("fields", "f2,f3,f4,f12,f14,f18");
+    url.searchParams.set("_", String(Date.now()));
 
-    const latestRaw = data.f43;
-    const prevRaw = data.f60;
-    if (latestRaw == null || prevRaw == null) return null;
+    const json = await fetchJson(url.toString());
+    const diff = json?.data?.diff;
+    const row = Array.isArray(diff) ? diff[0] : diff?.[info.secid];
+    if (!row) return null;
 
-    const latestPrice = latestRaw / info.scale;
-    const prevClose = prevRaw / info.scale;
-    const changeAmount = latestPrice - prevClose;
-    const changePercent = prevClose
-      ? Number(((changeAmount / prevClose) * 100).toFixed(6))
-      : 0;
+    const latestPrice = num(row.f2);
+    const changePercent = num(row.f3);
+    const changeAmount = num(row.f4);
+    const prevClose = num(row.f18);
+
+    if (latestPrice == null) return null;
+
+    // 若接口没给涨跌额，用昨收自行计算
+    const finalChangeAmount =
+      changeAmount != null
+        ? changeAmount
+        : prevClose != null
+        ? latestPrice - prevClose
+        : 0;
+
+    const finalChangePercent =
+      changePercent != null
+        ? Number(changePercent.toFixed(6))
+        : prevClose
+        ? Number((((latestPrice - prevClose) / prevClose) * 100).toFixed(6))
+        : 0;
 
     return {
-      name: data.f58 || code,
+      name: row.f14 || code,
       latestPrice,
-      changePercent,
-      changeAmount,
+      changePercent: finalChangePercent,
+      changeAmount: finalChangeAmount,
       source: "eastmoney",
       currency: info.currency,
       dailydata: null,
@@ -139,6 +187,114 @@ async function fetchPriceWithEastmoney(code) {
     console.log("Eastmoney price error:", e.message || e);
     return null;
   }
+}
+
+// ==============================
+// 东财实时价格（真正批量：ulist.np）
+// ==============================
+async function fetchPriceBatchUlist(codes) {
+  if (!codes.length) return {};
+
+  const results = {};
+  const codeInfos = [];
+
+  for (const code of codes) {
+    const info = convertCode(code);
+    if (info) codeInfos.push({ code, ...info });
+  }
+  if (!codeInfos.length) return {};
+
+  // 分批
+  const batches = [];
+  for (let i = 0; i < codeInfos.length; i += ULIST_BATCH_SIZE) {
+    batches.push(codeInfos.slice(i, i + ULIST_BATCH_SIZE));
+  }
+
+  for (let bi = 0; bi < batches.length; bi++) {
+    if (bi > 0) await sleep(ULIST_BATCH_DELAY_MS);
+
+    const batch = batches[bi];
+    const secids = batch.map((x) => x.secid).join(",");
+
+    const url = new URL("https://push2.eastmoney.com/api/qt/ulist.np/get");
+    url.searchParams.set("fltt", "2");
+    url.searchParams.set("secids", secids);
+    url.searchParams.set("fields", "f2,f3,f4,f12,f14,f18");
+    url.searchParams.set("_", String(Date.now()));
+
+    const data = await fetchJson(url.toString());
+    const diff = data?.data?.diff;
+
+    // 建立 secid / pureCode → 原始 code 的映射，方便回填
+    const secidToOrig = {};
+    const pureToOrig = {};
+    for (const item of batch) {
+      secidToOrig[item.secid] = item;
+      pureToOrig[item.pureCode] = item;
+      // 港股 pure 可能是 5 位，也兼容不带前导零
+      pureToOrig[String(Number(item.pureCode))] = item;
+    }
+
+    let got = 0;
+    const rows = Array.isArray(diff)
+      ? diff
+      : diff && typeof diff === "object"
+      ? Object.values(diff)
+      : [];
+
+    for (const row of rows) {
+      if (!row || row.f12 == null) continue;
+
+      const pure = String(row.f12).padStart(
+        String(row.f12).length <= 5 ? 5 : 6,
+        "0"
+      );
+      const item =
+        pureToOrig[pure] ||
+        pureToOrig[String(row.f12)] ||
+        pureToOrig[String(Number(row.f12))];
+
+      if (!item) continue;
+
+      const latestPrice = num(row.f2);
+      if (latestPrice == null) continue;
+
+      const changePercent = num(row.f3);
+      const changeAmount = num(row.f4);
+      const prevClose = num(row.f18);
+
+      const finalChangeAmount =
+        changeAmount != null
+          ? changeAmount
+          : prevClose != null
+          ? latestPrice - prevClose
+          : 0;
+
+      const finalChangePercent =
+        changePercent != null
+          ? Number(changePercent.toFixed(6))
+          : prevClose
+          ? Number((((latestPrice - prevClose) / prevClose) * 100).toFixed(6))
+          : 0;
+
+      results[item.code] = {
+        name: row.f14 || item.code,
+        latestPrice,
+        changePercent: finalChangePercent,
+        changeAmount: finalChangeAmount,
+        source: "eastmoney",
+        currency: item.currency,
+        dailydata: null,
+      };
+      got++;
+    }
+
+    console.log(
+      `ulist price batch ${bi + 1}/${batches.length} req=${batch.length} got=${got}`
+    );
+  }
+
+  return results;
 }
 
 // ==============================
@@ -195,10 +351,8 @@ async function getEastmoneyIntraday(code) {
 }
 
 // ==============================
-// 批量并发（限制并发数，避免瞬时打爆）
+// 分时批量（仍为单只接口，用并发 + 延迟控制）
 // ==============================
-const BATCH_CONCURRENCY = 8;
-
 async function runWithConcurrency(items, concurrency, worker) {
   const queue = items.slice();
   const runners = Array.from(
@@ -207,24 +361,16 @@ async function runWithConcurrency(items, concurrency, worker) {
       while (queue.length) {
         const item = queue.shift();
         await worker(item);
+        if (INTRADAY_DELAY_MS > 0) await sleep(INTRADAY_DELAY_MS);
       }
     }
   );
   await Promise.all(runners);
 }
 
-async function fetchPriceBatch(codes) {
-  const results = {};
-  await runWithConcurrency(codes, BATCH_CONCURRENCY, async (code) => {
-    const data = await fetchPriceWithEastmoney(code);
-    if (data) results[code] = data;
-  });
-  return results;
-}
-
 async function fetchIntradayBatch(codes) {
   const results = {};
-  await runWithConcurrency(codes, BATCH_CONCURRENCY, async (code) => {
+  await runWithConcurrency(codes, INTRADAY_CONCURRENCY, async (code) => {
     const data = await getEastmoneyIntraday(code);
     if (data) results[code] = data;
   });
@@ -261,7 +407,6 @@ async function handleSingle(url) {
         : json({ detail: `Intraday data not found for ${code}` }, 404);
     }
 
-    // 保持原接口语义（Cloudflare 端不支持这些类型）
     if (type === "info" || type === "movingaveragedata") {
       return json(
         { detail: `${type} not supported in Cloudflare Workers` },
@@ -306,7 +451,8 @@ async function handleBatch(request) {
 
   try {
     if (type === "price") {
-      return json(await fetchPriceBatch(validCodes));
+      // ★ 真正批量：ulist.np
+      return json(await fetchPriceBatchUlist(validCodes));
     }
     if (type === "intraday") {
       return json(await fetchIntradayBatch(validCodes));
@@ -327,7 +473,6 @@ export default {
     }
 
     const url = new URL(request.url);
-    // 去掉末尾斜杠，兼容 /querylocal/ 与 /api/querylocal/
     const path = url.pathname.replace(/\/$/, "") || "/";
 
     try {
@@ -337,6 +482,7 @@ export default {
           service: "eastmoney_querylocal_worker",
           timestamp: new Date().toISOString(),
           source: "eastmoney",
+          price_batch: "ulist.np",
         });
       }
 
