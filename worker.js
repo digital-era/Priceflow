@@ -102,8 +102,8 @@ async function handleSingleQuery(request, env, ctx) {
   // ---------- 新增 movingaveragedata ----------
   else if (type === "movingaveragedata") {
     const period = (url.searchParams.get("period") || "day").toLowerCase();
-    // ✅ 改动 1：默认复权类型 qfq → hfq
-    const adjust = (url.searchParams.get("adjust") || "hfq").toLowerCase();
+    // ✅ 改动 1：默认复权类型 hfq → qfq
+    const adjust = (url.searchParams.get("adjust") || "qfq").toLowerCase();
     const limit = parseInt(url.searchParams.get("limit") || "252", 10);
     const maParam = url.searchParams.get("ma") || "5,10,20,30,60,120,250";
 
@@ -403,8 +403,8 @@ async function fetchMovingAverageData(tencentCode, origCode, opts, env) {
   if (!p) return null;
 
   const adjustMap = { qfq: "qfq", hfq: "hfq", none: "" };
-  // ✅ 改动 2：非法值回退 qfq → hfq
-  const adj = adjustMap[adjust] !== undefined ? adjustMap[adjust] : "hfq";
+  // ✅ 改动 2：非法值回退 hfq → qfq
+  const adj = adjustMap[adjust] !== undefined ? adjustMap[adjust] : "qfq";
 
   const maPeriods = maParam
     .split(",")
