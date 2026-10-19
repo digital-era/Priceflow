@@ -96,7 +96,7 @@ async function handleSingleQuery(request, env, ctx) {
     const info = await fetchInfoWithTencent(tencentCode, code, env, fields);
     if (!info) return errorResponse(`Info data not found for ${code}`, 404);
     resultData = info;
-    ttl = 30;
+    ttl = 5; // ✅ 从 30 改为 5，与 price 对齐（因为含 latestPrice）
   }
 
   // ---------- 新增 movingaveragedata ----------
@@ -344,6 +344,10 @@ async function fetchIntradayBatch(codesInfo, tradeDate, env) {
 // ============================================================
 // info：腾讯实时快照基本面字段（保持不变）
 // ============================================================
+// ============================================================
+// info：price 的超集
+// 前 7 个字段与 price 完全一致，后 8 个为基本面扩展
+// ============================================================
 async function fetchInfoWithTencent(tencentCode, origCode, env, fieldsParam) {
   const url = `https://qt.gtimg.cn/q=${tencentCode}`;
   const res = await fetchWithRetry(url, env);
@@ -356,35 +360,78 @@ async function fetchInfoWithTencent(tencentCode, origCode, env, fieldsParam) {
   if (!match) return null;
 
   const f = match[1].split("~");
-  if (f.length < 49) return null;
+  // ✅ 放宽：只要够 33 个字段就能拿到 price 的基础信息
+  //    A 股通常 ≥ 50，港股/美股可能更短，扩展字段会置 null
+  if (f.length < 33) return null;
 
   const num = (v) => {
     const n = parseFloat(v);
     return Number.isFinite(n) ? n : null;
   };
 
+  // ---------- 前 7 个字段：与 price 逐字一致 ----------
+  const name = f[1] || origCode;
+  const latestRaw = parseFloat(f[3]);
+  const prevRaw = parseFloat(f[4]);
+
+  if (isNaN(latestRaw) || isNaN(prevRaw) || prevRaw === 0) return null;
+
+  const latestPrice = latestRaw;
+  const prevClose = prevRaw;
+  const changeAmount = latestPrice - prevClose;
+  const changePercent = prevClose
+    ? Number(((changeAmount / prevClose) * 100).toFixed(6))
+    : 0;
+
+  const currency = tencentCode.startsWith("hk")
+    ? "HKD"
+    : tencentCode.startsWith("us")
+      ? "USD"
+      : "CNY";
+
   const info = {
-    pe: num(f[39]),
-    pb: num(f[46]),
-    turnoverRate: num(f[38]),
-    amplitude: num(f[43]),
-    floatMarketCap: num(f[44]),
-    totalMarketCap: num(f[45]),
-    limitUp: num(f[47]),
-    limitDown: num(f[48]),
-    currency: tencentCode.startsWith("hk")
-      ? "HKD"
-      : tencentCode.startsWith("us")
-        ? "USD"
-        : "CNY",
-    source: "tencent_snapshot",
+    name,
+    latestPrice,
+    changePercent,
+    changeAmount,
+    source: "tencent",   // ✅ 与 price 一致
+    currency,
+    dailydata: null,     // ✅ 与 price 一致
   };
 
+  // ---------- 后 8 个字段：基本面扩展 ----------
+  // A 股快照 ≥ 49，扩展字段有值；港股/美股可能不足，全部置 null
+  if (f.length >= 49) {
+    info.pe = num(f[39]);
+    info.pb = num(f[46]);
+    info.turnoverRate = num(f[38]);
+    info.amplitude = num(f[43]);
+    info.floatMarketCap = num(f[44]);
+    info.totalMarketCap = num(f[45]);
+    info.limitUp = num(f[47]);
+    info.limitDown = num(f[48]);
+  } else {
+    info.pe = null;
+    info.pb = null;
+    info.turnoverRate = null;
+    info.amplitude = null;
+    info.floatMarketCap = null;
+    info.totalMarketCap = null;
+    info.limitUp = null;
+    info.limitDown = null;
+  }
+
+  // ---------- fields 过滤（覆盖全部 15 个字段） ----------
   if (fieldsParam) {
     const wanted = fieldsParam.split(",").map((s) => s.trim()).filter(Boolean);
-    const filtered = { source: "tencent_snapshot", currency: info.currency };
-    for (const key of wanted) {
-      if (key in info) filtered[key] = info[key];
+    const filtered = {
+      source: "tencent",
+      currency: currency,
+    };
+    // 按 info 的原始顺序填充，保证"前 7 后 8"的顺序
+    for (const key of Object.keys(info)) {
+      if (key === "source" || key === "currency") continue;
+      if (wanted.includes(key)) filtered[key] = info[key];
     }
     return filtered;
   }
