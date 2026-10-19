@@ -442,24 +442,19 @@ async function fetchInfoWithTencent(tencentCode, origCode, env, fieldsParam) {
 // ============================================================
 // movingaveragedata：腾讯 fqkline 历史 K 线 + 本地计算均线
 // ============================================================
+// ============================================================
+// 修改：movingaveragedata -> 只返回原始 K 线，不计算均线
+// ============================================================
 async function fetchMovingAverageData(tencentCode, origCode, opts, env) {
-  const { period, adjust, limit, maParam } = opts;
+  const { period, adjust, limit } = opts;
 
   const periodMap = { day: "day", week: "week", month: "month" };
-  const p = periodMap[period];
-  if (!p) return null;
-
+  const p = periodMap[period] || "day";
   const adjustMap = { qfq: "qfq", hfq: "hfq", none: "" };
-  // ✅ 改动 2：非法值回退 hfq → qfq
   const adj = adjustMap[adjust] !== undefined ? adjustMap[adjust] : "qfq";
 
-  const maPeriods = maParam
-    .split(",")
-    .map((s) => parseInt(s.trim(), 10))
-    .filter((n) => Number.isFinite(n) && n > 0);
-
-  const maxMa = Math.max(...maPeriods, 0);
-  const fetchCount = Math.min(640, limit + maxMa + 10);
+  // 多拉取 60 天用于前端计算 MA60 等长周期指标
+  const fetchCount = Math.min(640, limit + 60);
 
   const url =
     `https://web.ifzq.gtimg.cn/appstock/app/fqkline/get` +
@@ -469,7 +464,6 @@ async function fetchMovingAverageData(tencentCode, origCode, opts, env) {
   try {
     res = await fetchWithRetry(url, env);
   } catch (e) {
-    console.log(`fqkline error ${tencentCode}:`, e);
     return null;
   }
   if (!res.ok) return null;
@@ -478,14 +472,7 @@ async function fetchMovingAverageData(tencentCode, origCode, opts, env) {
   const node = json?.data?.[tencentCode];
   if (!node) return null;
 
-  let rows =
-    node[p] ||
-    node[`${adj}${p}`] ||
-    node[`${adj}day`] ||
-    node[`qfq${p}`] ||
-    node[`hfq${p}`] ||
-    null;
-
+  let rows = node[p] || node[`${adj}${p}`] || node[`qfq${p}`] || node[`hfq${p}`] || null;
   if (!rows || !Array.isArray(rows) || rows.length === 0) return null;
 
   const bars = [];
@@ -498,33 +485,21 @@ async function fetchMovingAverageData(tencentCode, origCode, opts, env) {
     const low = parseFloat(r[4]);
     const volume = parseFloat(r[5]);
     if (!date || isNaN(close)) continue;
-    bars.push({ date, open, close, high, low, volume: isNaN(volume) ? 0 : volume });
+    // 注意：腾讯的日K第7个字段有时候是成交额，但如果不稳定，前端可用 close*volume 估算，这里先存 null 或解析它。
+    const amount = r[6] ? parseFloat(r[6]) : null; 
+    
+    bars.push({ date, open, close, high, low, volume: isNaN(volume) ? 0 : volume, amount });
   }
 
   if (bars.length === 0) return null;
-
   bars.sort((a, b) => a.date.localeCompare(b.date));
 
-  for (const ma of maPeriods) {
-    for (let i = 0; i < bars.length; i++) {
-      if (i < ma - 1) {
-        bars[i][`ma${ma}`] = null;
-      } else {
-        let sum = 0;
-        for (let j = i - ma + 1; j <= i; j++) sum += bars[j].close;
-        bars[i][`ma${ma}`] = Number((sum / ma).toFixed(4));
-      }
-    }
-  }
-
-  const sliced = bars.slice(-limit);
-
+  // 直接返回基础 K 线，切片在最后
   return {
     code: origCode,
     period: p,
     adjust: adj || "none",
-    ma_periods: maPeriods,
-    rows: sliced,
+    rows: bars.slice(-limit), 
     source: "tencent_fqkline",
   };
 }
