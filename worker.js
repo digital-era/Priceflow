@@ -1,6 +1,6 @@
 // ============================================================
 // worker.js (Cloudflare Worker)
-// 腾讯行情 API 代理 —— 兼容原 QMT / MCP 接口契约
+// 腾讯行情 API 代理 —— 支持 A股/港股/美股/商品期货/全球指数
 // 数据源：qt.gtimg.cn（实时行情/基本面快照）
 //         web.ifzq.gtimg.cn（分钟分时、历史K线）
 // ============================================================
@@ -55,7 +55,6 @@ async function handleSingleQuery(request, env, ctx) {
   const tencentCode = convertToTencentCode(code);
   if (!tencentCode) return errorResponse(`Unsupported code format: ${code}`, 400);
 
-  // ✅ 扩展：info / movingaveragedata 纳入合法 type
   const SUPPORTED_TYPES = new Set(["price", "intraday", "info", "movingaveragedata"]);
   if (!SUPPORTED_TYPES.has(type)) {
     return errorResponse(`${type} not supported in this Tencent-backed version`, 501);
@@ -70,7 +69,7 @@ async function handleSingleQuery(request, env, ctx) {
   let resultData;
   let ttl = 5;
 
-  // ---------- 原有 price ----------
+  // ---------- price ----------
   if (type === "price") {
     const results = await fetchPriceBatch([{ orig: code, tencent: tencentCode }], env);
     resultData = results[code];
@@ -78,7 +77,7 @@ async function handleSingleQuery(request, env, ctx) {
     ttl = computeTTLByActualDate(type, resultData);
   }
 
-  // ---------- 原有 intraday ----------
+  // ---------- intraday ----------
   else if (type === "intraday") {
     const results = await fetchIntradayBatch(
       [{ orig: code, tencent: tencentCode }],
@@ -90,19 +89,18 @@ async function handleSingleQuery(request, env, ctx) {
     ttl = computeTTLByActualDate(type, resultData);
   }
 
-  // ---------- 新增 info ----------
+  // ---------- info ----------
   else if (type === "info") {
-    const fields = url.searchParams.get("fields"); // 可选：逗号分隔，缺省返回全部
+    const fields = url.searchParams.get("fields");
     const info = await fetchInfoWithTencent(tencentCode, code, env, fields);
     if (!info) return errorResponse(`Info data not found for ${code}`, 404);
     resultData = info;
-    ttl = 5; // ✅ 从 30 改为 5，与 price 对齐（因为含 latestPrice）
+    ttl = 5;
   }
 
-  // ---------- 新增 movingaveragedata ----------
+  // ---------- movingaveragedata ----------
   else if (type === "movingaveragedata") {
     const period = (url.searchParams.get("period") || "day").toLowerCase();
-    // ✅ 改动 1：默认复权类型 hfq → qfq
     const adjust = (url.searchParams.get("adjust") || "qfq").toLowerCase();
     const limit = parseInt(url.searchParams.get("limit") || "252", 10);
     const maParam = url.searchParams.get("ma") || "5,10,20,30,60,120,250";
@@ -113,7 +111,7 @@ async function handleSingleQuery(request, env, ctx) {
       { period, adjust, limit, maParam },
       env,
     );
-    if (!maResult || maResult.rows.length === 0) {
+    if (!maResult || !Array.isArray(maResult.rows) || maResult.rows.length === 0) {
       return errorResponse(`Moving average data not found for ${code}`, 404);
     }
     resultData = maResult;
@@ -127,7 +125,7 @@ async function handleSingleQuery(request, env, ctx) {
 
 // ============================================================
 // POST 批量查询（≤50 只）
-// 批量仅支持 price / intraday（保持不变）
+// 批量仅支持 price / intraday
 // ============================================================
 async function handleBatchQuery(request, env, ctx) {
   const body = await request.json().catch(() => null);
@@ -173,7 +171,7 @@ async function handleBatchQuery(request, env, ctx) {
 }
 
 // ============================================================
-// TTL 按实际返回数据日期计算（保持不变）
+// TTL 按实际返回数据日期计算
 // ============================================================
 function computeTTLByActualDate(type, result) {
   if (type === "price") return 5;
@@ -199,7 +197,7 @@ function computeTTLByActualDate(type, result) {
 }
 
 // ============================================================
-// 实时行情：腾讯 qt.gtimg.cn（保持不变）
+// 实时行情：腾讯 qt.gtimg.cn
 // ============================================================
 async function fetchPriceBatch(codesInfo, env) {
   const tencentCodes = deduplicateTencent(codesInfo.map((c) => c.tencent));
@@ -244,11 +242,7 @@ async function fetchPriceBatch(codesInfo, env) {
       ? Number(((changeAmount / prevClose) * 100).toFixed(6))
       : 0;
 
-    const currency = tencentCode.startsWith("hk")
-      ? "HKD"
-      : tencentCode.startsWith("us")
-        ? "USD"
-        : "CNY";
+    const currency = getCurrencyByCode(tencentCode);
 
     results[origCode] = {
       name,
@@ -265,14 +259,22 @@ async function fetchPriceBatch(codesInfo, env) {
 }
 
 // ============================================================
-// 分钟分时：腾讯 minute/query（保持不变）
+// 分钟分时：腾讯 minute/query（A股/港股） / UsMinute/query（美股）
 // ============================================================
 async function fetchIntradayBatch(codesInfo, tradeDate, env) {
   const results = {};
 
   for (const c of codesInfo) {
+    // 商品期货和外盘指数不支持分钟分时，直接跳过
+    if (c.tencent.startsWith("hf_") || isGlobalIndex(c.tencent)) {
+      continue;
+    }
+
+    // 美股使用专用的 UsMinute/query 接口
+    const isUS = c.tencent.startsWith("us") && !isGlobalIndex(c.tencent);
+    const apiPath = isUS ? "UsMinute" : "minute";
     const url =
-      `https://web.ifzq.gtimg.cn/appstock/app/minute/query` +
+      `https://web.ifzq.gtimg.cn/appstock/app/${apiPath}/query` +
       `?code=${c.tencent}`;
 
     try {
@@ -291,6 +293,12 @@ async function fetchIntradayBatch(codesInfo, tradeDate, env) {
 
       const rows = node.data.data;
       if (!Array.isArray(rows) || rows.length === 0) continue;
+
+      // 防御：美股分时接口有时只返回 1 个点，视为无效数据
+      if (isUS && rows.length <= 1) {
+        console.log(`US intraday insufficient data for ${c.orig}: ${rows.length} rows`);
+        continue;
+      }
 
       let prevCumVolume = 0;
       let prevCumAmount = 0;
@@ -343,9 +351,9 @@ async function fetchIntradayBatch(codesInfo, tradeDate, env) {
 
 // ============================================================
 // info：price 的超集
-// 前 15 个字段与 price 一致（顺序不变），后 9 个为 Colab 合并字段
-// 港股下标基于实测确认：pb=f[58]、turnoverRate=f[59]、股本=f[69]/f[70]
-// 美股无实测数据，沿用港股下标；无涨跌停/换手率，填 null
+// 前 15 个字段与 price 一致，后 9 个为 Colab 合并字段
+// 港股：pb=f[58]、turnoverRate=f[59]、股本=f[69]/f[70]
+// 美股：沿用港股下标；无涨跌停/换手率，填 null
 // ============================================================
 async function fetchInfoWithTencent(tencentCode, origCode, env, fieldsParam) {
   const url = `https://qt.gtimg.cn/q=${tencentCode}`;
@@ -359,7 +367,6 @@ async function fetchInfoWithTencent(tencentCode, origCode, env, fieldsParam) {
   if (!match) return null;
 
   const f = match[1].split("~");
-  // 基础字段至少要 33 个
   if (f.length < 33) return null;
 
   const num = (v) => {
@@ -368,9 +375,8 @@ async function fetchInfoWithTencent(tencentCode, origCode, env, fieldsParam) {
   };
 
   const isHK = tencentCode.startsWith("hk");
-  const isUS = tencentCode.startsWith("us");
+  const isUS = tencentCode.startsWith("us") && !isGlobalIndex(tencentCode);
 
-  // ---------- 前 7 个字段：与 price 逐字一致 ----------
   const name = f[1] || origCode;
   const latestRaw = parseFloat(f[3]);
   const prevRaw = parseFloat(f[4]);
@@ -384,7 +390,7 @@ async function fetchInfoWithTencent(tencentCode, origCode, env, fieldsParam) {
     ? Number(((changeAmount / prevClose) * 100).toFixed(6))
     : 0;
 
-  const currency = isHK ? "HKD" : (isUS ? "USD" : "CNY");
+  const currency = getCurrencyByCode(tencentCode);
 
   const info = {
     name,
@@ -396,12 +402,10 @@ async function fetchInfoWithTencent(tencentCode, origCode, env, fieldsParam) {
     dailydata: null,
   };
 
-  // ---------- 扩展字段：按市场分支取下标 ----------
   let pe = null, pb = null, turnoverRate = null, amplitude = null;
   let floatMV = null, totalMV = null, limitUp = null, limitDown = null;
 
   if (isHK) {
-    // 港股：实测确认 pb=f[58]、turnoverRate=f[59]，需 f.length >= 60
     if (f.length >= 60) {
       pe = num(f[39]);
       pb = num(f[58]);
@@ -409,15 +413,14 @@ async function fetchInfoWithTencent(tencentCode, origCode, env, fieldsParam) {
       amplitude = num(f[43]);
       floatMV = num(f[44]);
       totalMV = num(f[45]);
-      limitUp = null;      // 港股无涨跌停
+      limitUp = null;
       limitDown = null;
     }
   } else if (isUS) {
-    // 美股：无实测数据，沿用港股下标；无换手率/涨跌停
     if (f.length >= 60) {
       pe = num(f[39]);
       pb = num(f[58]);
-      turnoverRate = null; // 美股无换手率概念
+      turnoverRate = null;
       amplitude = num(f[43]);
       floatMV = num(f[44]);
       totalMV = num(f[45]);
@@ -425,7 +428,6 @@ async function fetchInfoWithTencent(tencentCode, origCode, env, fieldsParam) {
       limitDown = null;
     }
   } else {
-    // A 股：原有逻辑，需 f.length >= 49
     if (f.length >= 49) {
       pe = num(f[39]);
       pb = num(f[46]);
@@ -447,28 +449,16 @@ async function fetchInfoWithTencent(tencentCode, origCode, env, fieldsParam) {
   info.limitUp = limitUp;
   info.limitDown = limitDown;
 
-  // ---------- 后 9 个字段：Colab 合并字段 ----------
-  // roe：pb / pe × 100
   const roe = (pb != null && pe != null && pe !== 0)
     ? Number(((pb / pe) * 100).toFixed(2))
     : null;
 
-  // dividendYield：不接 Tushare，腾讯快照无可靠字段 → 恒 null
   const dividendYield = null;
-
-  // pg / rg：语义待定，恒 null
   const pg = null;
   const rg = null;
-
-  // yc：需额外请求 K 线，本次不实现 → 恒 null
   const yc = null;
-
-  // north：腾讯快照无北向资金 → 恒 null
   const north = null;
 
-  // totalShare / floatShare
-  // 港股：f[69]/f[70] 直接字段，单位"股"，/1e8 转"亿股"
-  // A 股/美股：用 市值(亿元) / 价格(元/股) = 亿股 计算
   let totalShare = null;
   let floatShare = null;
 
@@ -478,7 +468,6 @@ async function fetchInfoWithTencent(tencentCode, origCode, env, fieldsParam) {
     if (ts != null) totalShare = Number((ts / 1e8).toFixed(3));
     if (fsRaw != null) floatShare = Number((fsRaw / 1e8).toFixed(3));
   }
-  // 回退：市值 / 价格
   if (totalShare == null && totalMV != null && latestPrice > 0) {
     totalShare = Number((totalMV / latestPrice).toFixed(3));
   }
@@ -486,8 +475,6 @@ async function fetchInfoWithTencent(tencentCode, origCode, env, fieldsParam) {
     floatShare = Number((floatMV / latestPrice).toFixed(3));
   }
 
-  // amount：成交额换算为"亿元"
-  // A 股 f[37] 单位"万元"；港股/美股 f[37] 单位"元"
   const amountRaw = num(f[37]);
   let amount = null;
   if (amountRaw != null) {
@@ -508,7 +495,6 @@ async function fetchInfoWithTencent(tencentCode, origCode, env, fieldsParam) {
   info.floatShare = floatShare;
   info.amount = amount;
 
-  // ---------- fields 过滤（覆盖全部 24 个字段） ----------
   if (fieldsParam) {
     const wanted = fieldsParam.split(",").map((s) => s.trim()).filter(Boolean);
     const filtered = { source: "tencent", currency: currency };
@@ -523,10 +509,8 @@ async function fetchInfoWithTencent(tencentCode, origCode, env, fieldsParam) {
 }
 
 // ============================================================
-// movingaveragedata：腾讯 fqkline 历史 K 线 + 本地计算均线
-// ============================================================
-// ============================================================
-// 修改：movingaveragedata -> 只返回原始 K 线，不计算均线
+// movingaveragedata：腾讯 fqkline 历史 K 线
+// 美股需要补全交易所后缀（如 .OQ）
 // ============================================================
 async function fetchMovingAverageData(tencentCode, origCode, opts, env) {
   const { period, adjust, limit } = opts;
@@ -536,71 +520,89 @@ async function fetchMovingAverageData(tencentCode, origCode, opts, env) {
   const adjustMap = { qfq: "qfq", hfq: "hfq", none: "" };
   const adj = adjustMap[adjust] !== undefined ? adjustMap[adjust] : "qfq";
 
-  // 多拉取 60 天用于前端计算 MA60 等长周期指标
-  const fetchCount = Math.min(640, limit + 60);
+  const isUS = tencentCode.startsWith("us") && !isGlobalIndex(tencentCode);
 
-  const url =
-    `https://web.ifzq.gtimg.cn/appstock/app/fqkline/get` +
-    `?param=${tencentCode},${p},,,${fetchCount},${adj}`;
-
-  let res;
-  try {
-    res = await fetchWithRetry(url, env);
-  } catch (e) {
-    return null;
-  }
-  if (!res.ok) return null;
-
-  const json = await res.json();
-  const node = json?.data?.[tencentCode];
-  if (!node) return null;
-
-  let rows = node[p] || node[`${adj}${p}`] || node[`qfq${p}`] || node[`hfq${p}`] || null;
-  if (!rows || !Array.isArray(rows) || rows.length === 0) return null;
-
-  const bars = [];
-  for (const r of rows) {
-    if (!Array.isArray(r) || r.length < 6) continue;
-    const date = String(r[0] || "").slice(0, 10);
-    const open = parseFloat(r[1]);
-    const close = parseFloat(r[2]);
-    const high = parseFloat(r[3]);
-    const low = parseFloat(r[4]);
-    const volume = parseFloat(r[5]);
-    if (!date || isNaN(close)) continue;
-    // 注意：腾讯的日K第7个字段有时候是成交额，但如果不稳定，前端可用 close*volume 估算，这里先存 null 或解析它。
-    const amount = r[6] ? parseFloat(r[6]) : null; 
-    
-    bars.push({ date, open, close, high, low, volume: isNaN(volume) ? 0 : volume, amount });
+  // 美股 K线需要带交易所后缀，默认补 .OQ（纳斯达克），失败时尝试 .N（纽交所）
+  let candidates = [tencentCode];
+  if (isUS && !tencentCode.includes(".")) {
+    candidates = [tencentCode + ".OQ", tencentCode + ".N"];
   }
 
-  if (bars.length === 0) return null;
-  bars.sort((a, b) => a.date.localeCompare(b.date));
+  for (const candidate of candidates) {
+    const fetchCount = Math.min(640, limit + 60);
+    const url =
+      `https://web.ifzq.gtimg.cn/appstock/app/fqkline/get` +
+      `?param=${candidate},${p},,,${fetchCount},${adj}`;
 
-  // 直接返回基础 K 线，切片在最后
-  return {
-    code: origCode,
-    period: p,
-    adjust: adj || "none",
-    rows: bars.slice(-limit), 
-    source: "tencent_fqkline",
-  };
+    let res;
+    try {
+      res = await fetchWithRetry(url, env);
+    } catch (e) {
+      continue;
+    }
+    if (!res.ok) continue;
+
+    const json = await res.json();
+    const node = json?.data?.[candidate];
+    if (!node) continue;
+
+    let rows =
+      node[p] ||
+      node[`${adj}${p}`] ||
+      node[`qfq${p}`] ||
+      node[`hfq${p}`] ||
+      null;
+
+    if (!rows || !Array.isArray(rows) || rows.length === 0) continue;
+
+    // 防御：美股 K线有时只返回首尾两根，视为数据不完整
+    if (isUS && rows.length <= 2 && limit > 2) {
+      console.log(`US kline insufficient for ${origCode} (${candidate}): ${rows.length} rows`);
+      continue;
+    }
+
+    const bars = [];
+    for (const r of rows) {
+      if (!Array.isArray(r) || r.length < 6) continue;
+      const date = String(r[0] || "").slice(0, 10);
+      const open = parseFloat(r[1]);
+      const close = parseFloat(r[2]);
+      const high = parseFloat(r[3]);
+      const low = parseFloat(r[4]);
+      const volume = parseFloat(r[5]);
+      if (!date || isNaN(close)) continue;
+      const amount = r[6] ? parseFloat(r[6]) : null;
+
+      bars.push({ date, open, close, high, low, volume: isNaN(volume) ? 0 : volume, amount });
+    }
+
+    if (bars.length === 0) continue;
+    bars.sort((a, b) => a.date.localeCompare(b.date));
+
+    return {
+      code: origCode,
+      period: p,
+      adjust: adj || "none",
+      rows: bars.slice(-limit),
+      source: "tencent_fqkline",
+    };
+  }
+
+  return null;
 }
 
 // ============================================================
-// 腾讯代码转换（保持不变）
-// ============================================================
-// ============================================================
-// 腾讯代码转换：A股 / ETF / LOF / 可转债 / B股 / 北交所 / 港股 / 美股
+// 腾讯代码转换
+// A股 / ETF / 可转债 / B股 / 北交所 / 港股 / 美股 / 商品期货 / 全球指数
 // ============================================================
 function convertToTencentCode(code) {
   if (!code) return null;
   const text = String(code).trim().toUpperCase();
 
-  // 已带腾讯前缀（SH/SZ/HK/BJ + 数字）直接透传
-  if (/^(SH|SZ|HK|BJ)\d+/.test(text)) {
-    return text.toLowerCase();
-  }
+  // 已带腾讯前缀直接透传
+  if (/^(SH|SZ|HK|BJ)\d+/.test(text)) return text.toLowerCase();
+  if (/^HF_[A-Z]{2}$/.test(text)) return text.toLowerCase();
+  if (/^US(DJI|IXIC|INX|NDX)$/.test(text)) return text.toLowerCase();
 
   // 美股前缀 usAAPL / USAAPL
   if (text.startsWith("US") && text.length > 2) {
@@ -622,29 +624,20 @@ function convertToTencentCode(code) {
 
   // 纯数字
   if (/^\d+$/.test(text)) {
-    // 5 位 -> 港股
-    if (text.length === 5) {
-      return "hk" + text;
-    }
+    if (text.length === 5) return "hk" + text;
 
     if (text.length === 6) {
-      // 沪市：股票 60/68、基金/ETF/LOF 50/51/52/55/56/58、
-      //       可转债 11、B 股 900
-      if (/^(60|68|50|51|52|55|56|58|11|900)/.test(text)) {
+      if (/^(60|68|50|51|52|55|56|58|11|900|000)/.test(text)) {
         return "sh" + text;
       }
-      // 深市：股票 00/30、基金/ETF/LOF 15/16/18、
-      //       可转债 12、B 股 200
-      if (/^(00|30|15|16|18|12|200)/.test(text)) {
+      if (/^(00|30|15|16|18|12|200|399)/.test(text)) {
         return "sz" + text;
       }
-      // 北交所：92 / 83 / 87 / 88 / 43
       if (/^(92|83|87|88|43)/.test(text)) {
         return "bj" + text;
       }
       return null;
     }
-
     return null;
   }
 
@@ -653,14 +646,31 @@ function convertToTencentCode(code) {
     return "us" + text;
   }
 
+  // 港股指数
+  if (/^(HSI|HSCEI|HSCCI)$/.test(text)) {
+    return "hk" + text;
+  }
+
   return null;
 }
 
 // ============================================================
-// 辅助函数（保持不变）
+// 辅助函数
 // ============================================================
 function deduplicateTencent(codes) {
   return [...new Set(codes.filter(Boolean))];
+}
+
+function getCurrencyByCode(tencentCode) {
+  if (tencentCode.startsWith("hk")) return "HKD";
+  if (tencentCode.startsWith("us")) return "USD";
+  if (tencentCode.startsWith("hf_")) return "USD";
+  return "CNY";
+}
+
+function isGlobalIndex(tencentCode) {
+  return /^us(DJI|IXIC|INX|NDX)$/.test(tencentCode) ||
+         /^hk(HSI|HSCEI|HSCCI)$/.test(tencentCode);
 }
 
 function getBeijingToday() {
