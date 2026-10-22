@@ -342,11 +342,10 @@ async function fetchIntradayBatch(codesInfo, tradeDate, env) {
 }
 
 // ============================================================
-// info：腾讯实时快照基本面字段（保持不变）
-// ============================================================
-// ============================================================
 // info：price 的超集
-// 前 7 个字段与 price 完全一致，后 8 个为基本面扩展
+// 前 15 个字段与 price 一致（顺序不变），后 9 个为 Colab 合并字段
+// 港股下标基于实测确认：pb=f[58]、turnoverRate=f[59]、股本=f[69]/f[70]
+// 美股无实测数据，沿用港股下标；无涨跌停/换手率，填 null
 // ============================================================
 async function fetchInfoWithTencent(tencentCode, origCode, env, fieldsParam) {
   const url = `https://qt.gtimg.cn/q=${tencentCode}`;
@@ -360,14 +359,16 @@ async function fetchInfoWithTencent(tencentCode, origCode, env, fieldsParam) {
   if (!match) return null;
 
   const f = match[1].split("~");
-  // ✅ 放宽：只要够 33 个字段就能拿到 price 的基础信息
-  //    A 股通常 ≥ 50，港股/美股可能更短，扩展字段会置 null
+  // 基础字段至少要 33 个
   if (f.length < 33) return null;
 
   const num = (v) => {
     const n = parseFloat(v);
     return Number.isFinite(n) ? n : null;
   };
+
+  const isHK = tencentCode.startsWith("hk");
+  const isUS = tencentCode.startsWith("us");
 
   // ---------- 前 7 个字段：与 price 逐字一致 ----------
   const name = f[1] || origCode;
@@ -383,52 +384,134 @@ async function fetchInfoWithTencent(tencentCode, origCode, env, fieldsParam) {
     ? Number(((changeAmount / prevClose) * 100).toFixed(6))
     : 0;
 
-  const currency = tencentCode.startsWith("hk")
-    ? "HKD"
-    : tencentCode.startsWith("us")
-      ? "USD"
-      : "CNY";
+  const currency = isHK ? "HKD" : (isUS ? "USD" : "CNY");
 
   const info = {
     name,
     latestPrice,
     changePercent,
     changeAmount,
-    source: "tencent",   // ✅ 与 price 一致
+    source: "tencent",
     currency,
-    dailydata: null,     // ✅ 与 price 一致
+    dailydata: null,
   };
 
-  // ---------- 后 8 个字段：基本面扩展 ----------
-  // A 股快照 ≥ 49，扩展字段有值；港股/美股可能不足，全部置 null
-  if (f.length >= 49) {
-    info.pe = num(f[39]);
-    info.pb = num(f[46]);
-    info.turnoverRate = num(f[38]);
-    info.amplitude = num(f[43]);
-    info.floatMarketCap = num(f[44]);
-    info.totalMarketCap = num(f[45]);
-    info.limitUp = num(f[47]);
-    info.limitDown = num(f[48]);
+  // ---------- 扩展字段：按市场分支取下标 ----------
+  let pe = null, pb = null, turnoverRate = null, amplitude = null;
+  let floatMV = null, totalMV = null, limitUp = null, limitDown = null;
+
+  if (isHK) {
+    // 港股：实测确认 pb=f[58]、turnoverRate=f[59]，需 f.length >= 60
+    if (f.length >= 60) {
+      pe = num(f[39]);
+      pb = num(f[58]);
+      turnoverRate = num(f[59]);
+      amplitude = num(f[43]);
+      floatMV = num(f[44]);
+      totalMV = num(f[45]);
+      limitUp = null;      // 港股无涨跌停
+      limitDown = null;
+    }
+  } else if (isUS) {
+    // 美股：无实测数据，沿用港股下标；无换手率/涨跌停
+    if (f.length >= 60) {
+      pe = num(f[39]);
+      pb = num(f[58]);
+      turnoverRate = null; // 美股无换手率概念
+      amplitude = num(f[43]);
+      floatMV = num(f[44]);
+      totalMV = num(f[45]);
+      limitUp = null;
+      limitDown = null;
+    }
   } else {
-    info.pe = null;
-    info.pb = null;
-    info.turnoverRate = null;
-    info.amplitude = null;
-    info.floatMarketCap = null;
-    info.totalMarketCap = null;
-    info.limitUp = null;
-    info.limitDown = null;
+    // A 股：原有逻辑，需 f.length >= 49
+    if (f.length >= 49) {
+      pe = num(f[39]);
+      pb = num(f[46]);
+      turnoverRate = num(f[38]);
+      amplitude = num(f[43]);
+      floatMV = num(f[44]);
+      totalMV = num(f[45]);
+      limitUp = num(f[47]);
+      limitDown = num(f[48]);
+    }
   }
 
-  // ---------- fields 过滤（覆盖全部 15 个字段） ----------
+  info.pe = pe;
+  info.pb = pb;
+  info.turnoverRate = turnoverRate;
+  info.amplitude = amplitude;
+  info.floatMarketCap = floatMV;
+  info.totalMarketCap = totalMV;
+  info.limitUp = limitUp;
+  info.limitDown = limitDown;
+
+  // ---------- 后 9 个字段：Colab 合并字段 ----------
+  // roe：pb / pe × 100
+  const roe = (pb != null && pe != null && pe !== 0)
+    ? Number(((pb / pe) * 100).toFixed(2))
+    : null;
+
+  // dividendYield：不接 Tushare，腾讯快照无可靠字段 → 恒 null
+  const dividendYield = null;
+
+  // pg / rg：语义待定，恒 null
+  const pg = null;
+  const rg = null;
+
+  // yc：需额外请求 K 线，本次不实现 → 恒 null
+  const yc = null;
+
+  // north：腾讯快照无北向资金 → 恒 null
+  const north = null;
+
+  // totalShare / floatShare
+  // 港股：f[69]/f[70] 直接字段，单位"股"，/1e8 转"亿股"
+  // A 股/美股：用 市值(亿元) / 价格(元/股) = 亿股 计算
+  let totalShare = null;
+  let floatShare = null;
+
+  if (isHK && f.length >= 71) {
+    const ts = num(f[69]);
+    const fsRaw = num(f[70]);
+    if (ts != null) totalShare = Number((ts / 1e8).toFixed(3));
+    if (fsRaw != null) floatShare = Number((fsRaw / 1e8).toFixed(3));
+  }
+  // 回退：市值 / 价格
+  if (totalShare == null && totalMV != null && latestPrice > 0) {
+    totalShare = Number((totalMV / latestPrice).toFixed(3));
+  }
+  if (floatShare == null && floatMV != null && latestPrice > 0) {
+    floatShare = Number((floatMV / latestPrice).toFixed(3));
+  }
+
+  // amount：成交额换算为"亿元"
+  // A 股 f[37] 单位"万元"；港股/美股 f[37] 单位"元"
+  const amountRaw = num(f[37]);
+  let amount = null;
+  if (amountRaw != null) {
+    if (isHK || isUS) {
+      amount = Number((amountRaw / 1e8).toFixed(2));
+    } else {
+      amount = Number((amountRaw / 1e4).toFixed(2));
+    }
+  }
+
+  info.roe = roe;
+  info.dividendYield = dividendYield;
+  info.pg = pg;
+  info.rg = rg;
+  info.yc = yc;
+  info.north = north;
+  info.totalShare = totalShare;
+  info.floatShare = floatShare;
+  info.amount = amount;
+
+  // ---------- fields 过滤（覆盖全部 24 个字段） ----------
   if (fieldsParam) {
     const wanted = fieldsParam.split(",").map((s) => s.trim()).filter(Boolean);
-    const filtered = {
-      source: "tencent",
-      currency: currency,
-    };
-    // 按 info 的原始顺序填充，保证"前 7 后 8"的顺序
+    const filtered = { source: "tencent", currency: currency };
     for (const key of Object.keys(info)) {
       if (key === "source" || key === "currency") continue;
       if (wanted.includes(key)) filtered[key] = info[key];
