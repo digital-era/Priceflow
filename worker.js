@@ -590,40 +590,65 @@ async function fetchMovingAverageData(tencentCode, origCode, opts, env) {
 // ============================================================
 // 腾讯代码转换（保持不变）
 // ============================================================
+// ============================================================
+// 腾讯代码转换：A股 / ETF / LOF / 可转债 / B股 / 北交所 / 港股 / 美股
+// ============================================================
 function convertToTencentCode(code) {
   if (!code) return null;
   const text = String(code).trim().toUpperCase();
 
+  // 已带腾讯前缀（SH/SZ/HK/BJ + 数字）直接透传
   if (/^(SH|SZ|HK|BJ)\d+/.test(text)) {
     return text.toLowerCase();
   }
 
+  // 美股前缀 usAAPL / USAAPL
   if (text.startsWith("US") && text.length > 2) {
     const rest = text.substring(2);
     if (/^[A-Z]{1,5}$/.test(rest)) return "us" + rest;
   }
 
+  // QMT 后缀：600519.SH / 000001.SZ / 920982.BJ
   const qmtMatch = text.match(/^(\d{6})\.(SH|SZ|BJ)$/);
   if (qmtMatch) {
     return qmtMatch[2].toLowerCase() + qmtMatch[1];
   }
 
+  // HK 前缀：HK00700 -> hk00700
   if (text.startsWith("HK")) {
     const pure = text.substring(2);
     if (/^\d+$/.test(pure)) return "hk" + pure;
   }
 
-  if (/^\d{6}$/.test(text)) {
-    if (/^(60|68|90)/.test(text)) return "sh" + text;
-    if (/^(00|30)/.test(text)) return "sz" + text;
-    if (/^92/.test(text)) return "bj" + text;
+  // 纯数字
+  if (/^\d+$/.test(text)) {
+    // 5 位 -> 港股
+    if (text.length === 5) {
+      return "hk" + text;
+    }
+
+    if (text.length === 6) {
+      // 沪市：股票 60/68、基金/ETF/LOF 50/51/52/55/56/58、
+      //       可转债 11、B 股 900
+      if (/^(60|68|50|51|52|55|56|58|11|900)/.test(text)) {
+        return "sh" + text;
+      }
+      // 深市：股票 00/30、基金/ETF/LOF 15/16/18、
+      //       可转债 12、B 股 200
+      if (/^(00|30|15|16|18|12|200)/.test(text)) {
+        return "sz" + text;
+      }
+      // 北交所：92 / 83 / 87 / 88 / 43
+      if (/^(92|83|87|88|43)/.test(text)) {
+        return "bj" + text;
+      }
+      return null;
+    }
+
     return null;
   }
 
-  if (/^\d{5}$/.test(text)) {
-    return "hk" + text;
-  }
-
+  // 纯字母 1-5 位 -> 美股
   if (/^[A-Z]{1,5}$/.test(text)) {
     return "us" + text;
   }
