@@ -627,7 +627,8 @@ function convertToTencentCode(code) {
     if (text.length === 5) return "hk" + text;
 
     if (text.length === 6) {
-      if (/^(60|68|50|51|52|55|56|58|11|900|000)/.test(text)) {
+      // ✅ 修复后：移除 |000，000xxx 全部走深市；上证指数需显式 sh 前缀
+      if (/^(60|68|50|51|52|55|56|58|11|900)/.test(text)) {
         return "sh" + text;
       }
       if (/^(00|30|15|16|18|12|200|399)/.test(text)) {
