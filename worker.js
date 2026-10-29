@@ -517,8 +517,7 @@ async function fetchMovingAverageData(tencentCode, origCode, opts, env) {
 
   const periodMap = { day: "day", week: "week", month: "month" };
   const p = periodMap[period] || "day";
-  //const adjustMap = { qfq: "qfq", hfq: "hfq", none: "" };
-  const adjustMap = { qfq: "qfq", hfq: "hfq", none: "none" };
+  const adjustMap = { qfq: "qfq", hfq: "hfq", none: "" };
   const adj = adjustMap[adjust] !== undefined ? adjustMap[adjust] : "qfq";
 
   const isUS = tencentCode.startsWith("us") && !isGlobalIndex(tencentCode);
