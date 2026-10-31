@@ -647,6 +647,12 @@ function convertToTencentCode(code) {
     return "us" + text;
   }
 
+  // ⭐ 核心修复：兼容带点号或横杠的美股特殊代码（如 BRK.A / BRK-A）
+  if (/^[A-Z]{1,5}[\.\-][A-Z]{1,2}$/.test(text)) {
+    // 统一转换为腾讯接口支持的格式（腾讯通常支持点号）
+    return "us" + text; 
+  }
+
   // 港股指数
   if (/^(HSI|HSCEI|HSCCI)$/.test(text)) {
     return "hk" + text;
