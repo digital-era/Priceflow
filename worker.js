@@ -690,16 +690,55 @@ function getBeijingToday() {
   return fmt.format(new Date()).replace(/-/g, "");
 }
 
+// ============================================================
+// ⭐ 核心优化：带超时、多目标URL轮换、空body 404判定的 fetch
+// - 遇到空body的404（WAF伪装过载）：切换到下一个URL重试
+// - 遇到5xx/429：沿用原有指数退避重试，并切换端点
+// - 业务404（带JSON detail）：不重试，直接返回
+// ============================================================
+
+// 腾讯行情多端点轮换池（社区实践整理）
+const TENCENT_ENDPOINTS = {
+  // 实时行情：qt.gtimg.cn 主域，sqt 系列为备用入口
+  price: [
+    { host: "qt.gtimg.cn", pathPrefix: "" },
+    { host: "web.sqt.gtimg.cn", pathPrefix: "" },
+    { host: "sqt.gtimg.cn", pathPrefix: "/utf8" },
+  ],
+  // K线/分时接口：web.ifzq 主域，ifzq 备用，proxy.finance.qq.com 为镜像
+  kline: [
+    { host: "web.ifzq.gtimg.cn", pathPrefix: "" },
+    { host: "ifzq.gtimg.cn", pathPrefix: "" },
+    { host: "proxy.finance.qq.com", pathPrefix: "/ifzqgtimg", replaceFqkline: true },
+  ],
+  minute: [
+    { host: "web.ifzq.gtimg.cn", pathPrefix: "" },
+    { host: "ifzq.gtimg.cn", pathPrefix: "" },
+    { host: "proxy.finance.qq.com", pathPrefix: "/ifzqgtimg" },
+  ],
+};
+
 async function fetchWithRetry(url, env, retries = 3) {
   const timeoutMs = 8000;
   let lastError;
+  
+  // ✅ 隐患1修复：将 rotationIndex 改为函数内的局部变量
+  // 确保每个请求的第一次尝试永远走首选端点（endpoints[0]），不受其他请求影响
+  let rotationIndex = 0;
+
+  const { pathAndQuery, type } = parseTencentUrl(url);
+  const endpoints = TENCENT_ENDPOINTS[type] || [{ host: new URL(url).hostname, pathPrefix: "" }];
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
-      const res = await fetch(url, {
+      // 按轮换索引选择当前端点
+      const endpoint = endpoints[rotationIndex % endpoints.length];
+      const targetUrl = buildTencentUrl(endpoint, pathAndQuery, type);
+
+      const res = await fetch(targetUrl, {
         signal: controller.signal,
         headers: {
           "User-Agent":
@@ -707,20 +746,116 @@ async function fetchWithRetry(url, env, retries = 3) {
         },
       });
       clearTimeout(timer);
-      if (!res.ok) {
-        if (res.status >= 500) throw new Error(`HTTP ${res.status}`);
+
+      // ---------- 2xx：成功 ----------
+      if (res.ok) return res;
+
+      // ---------- 5xx：服务端错误，退避重试 ----------
+      if (res.status >= 500) {
+        lastError = new Error(`HTTP ${res.status} from ${endpoint.host}`);
+        if (attempt < retries) {
+          await sleep(withJitter(Math.pow(2, attempt) * 500));
+          rotationIndex++; // 切换端点
+          continue;
+        }
+        throw lastError;
+      }
+
+      // ---------- 429：限流，按 Retry-After 重试 ----------
+      if (res.status === 429) {
+        const retryAfter = parseInt(res.headers.get("Retry-After") || "0", 10);
+        lastError = new Error(`HTTP 429 from ${endpoint.host}`);
+        if (attempt < retries) {
+          const waitMs = retryAfter > 0 ? retryAfter * 1000 : Math.pow(2, attempt) * 1000;
+          await sleep(withJitter(waitMs));
+          rotationIndex++;
+          continue;
+        }
         return res;
       }
+
+      // ---------- ⭐ 404：区分“业务错误”与“过载伪装” ----------
+      if (res.status === 404) {
+        const clonedRes = res.clone();
+        const text = await clonedRes.text();
+        
+        // 关键判断：空body的404，大概率是WAF/过载伪装
+        if (text.trim() === "") {
+          lastError = new Error(`HTTP 404 (empty body, possible overload) from ${endpoint.host}`);
+          if (attempt < 2) { // 针对过载伪装最多重试2次
+            await sleep(withJitter(1000 * (attempt + 1)));
+            rotationIndex++; // 切换端点
+            continue;
+          }
+          // 重试耗尽后仍返回404，交给上层处理
+        }
+        // 带内容的404（如 {"detail":"..."}），是业务错误，直接返回
+        return res;
+      }
+
+      // ---------- 其他4xx（403/400等）：直接返回 ----------
       return res;
     } catch (e) {
       clearTimeout(timer);
       lastError = e;
       if (attempt < retries) {
-        await sleep(Math.pow(2, attempt) * 500);
+        await sleep(withJitter(Math.pow(2, attempt) * 500));
+        rotationIndex++;
+        continue;
       }
     }
   }
+
   throw lastError;
+}
+
+// 解析腾讯URL，提取接口类型和路径，用于选择备用端点
+function parseTencentUrl(url) {
+  const u = new URL(url);
+  const host = u.hostname;
+  const pathAndQuery = u.pathname + u.search;
+
+  if (host.includes("qt.gtimg.cn")) {
+    return { pathAndQuery, type: "price" };
+  }
+  if (pathAndQuery.includes("fqkline")) {
+    return { pathAndQuery, type: "kline" };
+  }
+  // ✅ 隐患2修复：加入 /i 忽略大小写，确保美股 UsMinute 也能正确匹配到 minute 端点池
+  if (/minute/i.test(pathAndQuery)) {
+    return { pathAndQuery, type: "minute" };
+  }
+  return { pathAndQuery, type: "kline" }; // 默认
+}
+
+// 根据端点配置和原始路径，构建目标URL
+function buildTencentUrl(endpoint, pathAndQuery, type) {
+  let path = pathAndQuery;
+
+  // price 接口路径特殊处理：qt.gtimg.cn 路径为 /q=...，sqt 系列为 /utf8/q=...
+  if (type === "price") {
+    if (endpoint.pathPrefix === "/utf8") {
+      // sqt.gtimg.cn 需要 /utf8 前缀
+      path = "/utf8" + path;
+    }
+    // web.sqt.gtimg.cn 直接使用 /q=...，无需前缀
+  } else {
+    // kline / minute 接口：proxy.finance.qq.com 需要 /ifzqgtimg 前缀
+    if (endpoint.pathPrefix) {
+      path = endpoint.pathPrefix + path;
+    }
+    // proxy 镜像将 fqkline 替换为 newfqkline
+    if (endpoint.replaceFqkline && type === "kline") {
+      path = path.replace("fqkline", "newfqkline");
+    }
+  }
+
+  return `https://${endpoint.host}${path}`;
+}
+
+// 指数退避 + 随机抖动，避免多请求同步重试造成的“重试风暴”
+function withJitter(ms) {
+  return ms + Math.random() * 300;
 }
 
 function sleep(ms) {
