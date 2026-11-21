@@ -402,6 +402,40 @@ function resolveAsset(rawCode) {
     };
   }
 
+    // ⭐ 通用兜底 1：点前缀指数（.NBI / .SOX / .RUT / .DJI / .HSI / .FTSE ...）
+  //   Yahoo 用 ^XXX，CNBC 用 .XXX —— 通用转换，无需每个都定义
+  if (/^\.[A-Z]{1,5}$/.test(text)) {
+    const sym = text.substring(1);              // .NBI → NBI
+    return {
+      kind: "us",
+      isIndex: true,
+      orig,
+      displayName: sym,                          // 无中文名，显示原始代码
+      yahoo: "^" + sym,                          // .NBI → ^NBI
+      cnbc: text,                                // .NBI → .NBI
+      tencent: null,
+      nasdaq: null,
+      currency: "USD",
+    };
+  }
+
+  // ⭐ 通用兜底 2：Yahoo 风格 ^ 前缀指数（用户直接粘贴 ^NBI）
+  if (/^\^[A-Z]{1,5}$/.test(text)) {
+    const sym = text.substring(1);              // ^NBI → NBI
+    return {
+      kind: "us",
+      isIndex: true,
+      orig,
+      displayName: sym,
+      yahoo: text,                               // ^NBI
+      cnbc: "." + sym,                           // ^NBI → .NBI（CNBC 兜底）
+      tencent: null,
+      nasdaq: null,
+      currency: "USD",
+    };
+  }
+
+
   // 美股个股 / ETF：AAPL, usAAPL, BRK.A, BRK-B, usBRK.B
   let usSym = text;
   if (usSym.startsWith("US") && usSym.length > 2) {
