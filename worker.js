@@ -377,6 +377,7 @@ function resolveAsset(rawCode) {
     "IXIC":  { yahoo: "^IXIC", cnbc: ".IXIC", tencent: "usIXIC", name: "纳斯达克综合指数" },
     ".IXIC": { yahoo: "^IXIC", cnbc: ".IXIC", tencent: "usIXIC", name: "纳斯达克综合指数" },
     "USINX": { yahoo: "^GSPC", cnbc: ".SPX", tencent: "usINX", name: "标普500指数" },
+    ".INX": { yahoo: "^GSPC", cnbc: ".SPX", tencent: "usINX", name: "标普500指数" },
     "^GSPC": { yahoo: "^GSPC", cnbc: ".SPX", tencent: "usINX", name: "标普500指数" },
     "SPX":   { yahoo: "^GSPC", cnbc: ".SPX", tencent: "usINX", name: "标普500指数" },
     "GSPC":  { yahoo: "^GSPC", cnbc: ".SPX", tencent: "usINX", name: "标普500指数" },
@@ -384,8 +385,15 @@ function resolveAsset(rawCode) {
     "USNDX": { yahoo: "^NDX", cnbc: ".NDX", tencent: "usNDX", name: "纳斯达克100指数" },
     "^NDX":  { yahoo: "^NDX", cnbc: ".NDX", tencent: "usNDX", name: "纳斯达克100指数" },
     "NDX":   { yahoo: "^NDX", cnbc: ".NDX", tencent: "usNDX", name: "纳斯达克100指数" },
+    ".NDX":   { yahoo: "^NDX", cnbc: ".NDX", tencent: "usNDX", name: "纳斯达克100指数" },
     "^VIX":  { yahoo: "^VIX", cnbc: ".VIX", tencent: null, name: "VIX恐慌指数" },
     "VIX":   { yahoo: "^VIX", cnbc: ".VIX", tencent: null, name: "VIX恐慌指数" },
+    ".NBI":  { yahoo: "^NBI",  cnbc: ".NBI",  tencent: None, name: "纳斯达克生物技术指数"},
+    "^NBI":  { yahoo: "^NBI",  cnbc: ".NBI",  tencent: None, name: "纳斯达克生物技术指数"},
+    "SOX":   { yahoo: "^SOX",  cnbc: ".SOX",  tencent: None, name: "费城半导体指数"},
+    ".SOX":  { yahoo: "^SOX",  cnbc: ".SOX",  tencent: None, name: "费城半导体指数"},
+    "RUT":   { yahoo: "^RUT",  cnbc: ".RUT",  tencent: None, name: "罗素2000指数"},
+    ".RUT":  { yahoo: "^RUT",  cnbc: ".RUT",  tencent: None, name: "罗素2000指数"},
   };
   if (US_INDEX_MAP[text]) {
     const idx = US_INDEX_MAP[text];
