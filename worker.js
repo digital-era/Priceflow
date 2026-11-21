@@ -388,12 +388,12 @@ function resolveAsset(rawCode) {
     ".NDX":   { yahoo: "^NDX", cnbc: ".NDX", tencent: "usNDX", name: "纳斯达克100指数" },
     "^VIX":  { yahoo: "^VIX", cnbc: ".VIX", tencent: null, name: "VIX恐慌指数" },
     "VIX":   { yahoo: "^VIX", cnbc: ".VIX", tencent: null, name: "VIX恐慌指数" },
-    ".NBI":  { yahoo: "^NBI",  cnbc: ".NBI",  tencent: None, name: "纳斯达克生物技术指数"},
-    "^NBI":  { yahoo: "^NBI",  cnbc: ".NBI",  tencent: None, name: "纳斯达克生物技术指数"},
-    "SOX":   { yahoo: "^SOX",  cnbc: ".SOX",  tencent: None, name: "费城半导体指数"},
-    ".SOX":  { yahoo: "^SOX",  cnbc: ".SOX",  tencent: None, name: "费城半导体指数"},
-    "RUT":   { yahoo: "^RUT",  cnbc: ".RUT",  tencent: None, name: "罗素2000指数"},
-    ".RUT":  { yahoo: "^RUT",  cnbc: ".RUT",  tencent: None, name: "罗素2000指数"},
+    ".NBI":  { yahoo: "^NBI", cnbc: ".NBI", tencent: null, name: "纳斯达克生物技术指数"},
+    "^NBI":  { yahoo: "^NBI", cnbc: ".NBI", tencent: null, name: "纳斯达克生物技术指数"},
+    "SOX":   { yahoo: "^SOX", cnbc: ".SOX", tencent: null, name: "费城半导体指数"},
+    ".SOX":  { yahoo: "^SOX", cnbc: ".SOX", tencent: null, name: "费城半导体指数"},
+    "RUT":   { yahoo: "^RUT", cnbc: ".RUT", tencent: null, name: "罗素2000指数"},
+    ".RUT":  { yahoo: "^RUT", cnbc: ".RUT", tencent: null, name: "罗素2000指数"},
   };
   if (US_INDEX_MAP[text]) {
     const idx = US_INDEX_MAP[text];
