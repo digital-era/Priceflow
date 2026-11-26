@@ -236,10 +236,29 @@ function resolveAsset(rawCode) {
   if (!rawCode) return null;
   const orig = String(rawCode);
   let text = orig.trim().toUpperCase();
-  // 兼容：若外部传入带交易所前缀的格式（如 FOREXCOM:NSXUSD），自动剥离前缀
   if (text.includes(":") && !/^\d{6}\.(SH|SZ|BJ)$/.test(text)) {
     text = text.split(":").pop().trim();
-  }  
+  }
+
+  // ---------- ⭐ 0.5 仅 HK50/HSI 走腾讯 hkHSI（防止被下方 HK\d+ 劫持成 hk50） ----------
+  if (text === "HK50" || text === "HSI") {
+    return { kind: "tencent", orig, tencent: "hkHSI" };
+  }
+
+  // ---------- ⭐ 0.6 CHINA50 / XIN9 不走腾讯，走 Yahoo 海外 2823.HK（安硕富时A50） ----------
+  if (text === "CHINA50" || text === "XIN9") {
+    return {
+      kind: "us",
+      isIndex: true,
+      orig,
+      displayName: text === "CHINA50" ? "富时中国A50 (2823.HK)" : "富时中国A50指数 (2823.HK)",
+      yahoo: "2823.HK",
+      cnbc: null,
+      tencent: null, // 明确置空，绝不走腾讯
+      nasdaq: null,
+      currency: "HKD",
+    };
+  }
 
   // ---------- 1. 显式 A股 / 港股 / 北交所 ----------
   if (/^(SH|SZ|HK|BJ)\d+$/.test(text)) {
@@ -286,7 +305,7 @@ function resolveAsset(rawCode) {
     return buildFxAsset(orig, "USD", "CNY", "fx_susdcny", "CNY=X");
   }
   if (text === "CNH=X") {
-    return buildFxAsset(orig, "USD", "CNH", "fx_susdcnh", "USDCNH=X");
+    return buildFxAsset(orig, "USD", "CNH", "fx_susdcnh", ["USDCNH=X", "CNH=X"]);
   }
   const fxClean = text.replace(/=X$/, "").replace(/[\/\-]/g, "");
   if (/^(USD|EUR|GBP|JPY|CHF|AUD|NZD|CAD|CNY|CNH|HKD|SGD|KRW|INR|TWD)(USD|EUR|GBP|JPY|CHF|AUD|NZD|CAD|CNY|CNH|HKD|SGD|KRW|INR|TWD)$/.test(fxClean)) {
@@ -301,7 +320,7 @@ function resolveAsset(rawCode) {
     "HF_GC":  { yahoo: "GC=F", name: "COMEX黄金", sina: "hf_GC",  cnbc: "@GC.1" },
     "HF_XAU": { yahoo: "XAUUSD=X", name: "伦敦金", sina: "hf_XAU", cnbc: "XAU=" },
     "GC=F":   { yahoo: "GC=F", name: "COMEX黄金", sina: "hf_GC",  cnbc: "@GC.1" },
-    "XAUUSD": { yahoo: "XAUUSD=X", name: "伦敦金(现货)", sina: "hf_XAU", cnbc: "XAU=" },
+    "XAUUSD": { yahoo: "GC=F", name: "黄金(COMEX连续)", sina: "hf_GC", cnbc: "@GC.1" },
     "XAUUSD=X": { yahoo: "XAUUSD=X", name: "伦敦金", sina: "hf_XAU", cnbc: "XAU=" },
     "XAU":    { yahoo: "GC=F", name: "黄金", sina: "hf_XAU", cnbc: "XAU=" },
     "GOLD":   { yahoo: "GC=F", name: "COMEX黄金", sina: "hf_GC", cnbc: "@GC.1" },
@@ -525,7 +544,8 @@ function resolveAsset(rawCode) {
 
 function buildFxAsset(orig, base, quote, sinaOverride = null, yahooOverride = null) {
   const pair = base + quote;
-  const yahoo = yahooOverride || (pair === "USDCNH" ? "CNH=X" : `${pair}=X`);
+    // ⭐ 离岸人民币：优先标准 USDCNH=X，若该节点无数据自动切 CNH=X（纯 Yahoo）
+  const yahoo = yahooOverride || (pair === "USDCNH" ? ["USDCNH=X", "CNH=X"] : `${pair}=X`);
   const currency = quote === "CNH" ? "CNY" : quote;
   const cnbcMap = {
     USDCNY: "CNY=",
@@ -835,25 +855,32 @@ async function fetchGlobalMovingAverageData(asset, opts, env) {
 // Yahoo Finance v8/finance/chart 实现（query1 / query2 双端点容灾）
 // ============================================================
 async function fetchYahooChartRaw(yahooSymbol, interval = "1d", range = "5d") {
-  const encoded = encodeURIComponent(yahooSymbol);
-  const path = `/v8/finance/chart/${encoded}?interval=${interval}&range=${range}&includePrePost=false`;
+  const symbols = Array.isArray(yahooSymbol) ? yahooSymbol : [yahooSymbol];
   const hosts = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"];
 
-  for (let i = 0; i < hosts.length; i++) {
-    const url = `https://${hosts[i]}${path}`;
-    try {
-      const res = await fetchExternal(url, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-          "Accept": "application/json",
-        },
-      }, 6500);
-      if (!res.ok) continue;
-      const json = await res.json();
-      const result = json?.chart?.result?.[0];
-      if (result && result.meta) return result;
-    } catch (e) {
-      // 切换 query2 重试
+  for (const sym of symbols) {
+    if (!sym) continue;
+    const encoded = encodeURIComponent(sym);
+    const path = `/v8/finance/chart/${encoded}?interval=${interval}&range=${range}&includePrePost=false`;
+
+    for (let i = 0; i < hosts.length; i++) {
+      const url = `https://${hosts[i]}${path}`;
+      try {
+        const res = await fetchExternal(url, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+          },
+        }, 6500);
+        if (!res.ok) continue;
+        const json = await res.json();
+        const result = json?.chart?.result?.[0];
+        const hasPrice = result?.meta && numOrNull(result.meta.regularMarketPrice) != null;
+        const hasBars = Array.isArray(result?.timestamp) && result.timestamp.length > 0;
+        if (result && result.meta && (hasPrice || hasBars)) {
+          return result;
+        }
+      } catch (e) {}
     }
   }
   return null;
@@ -1455,7 +1482,8 @@ async function fetchIntradayBatch(codesInfo, tradeDate, env) {
   const results = {};
 
   for (const c of codesInfo) {
-    if (c.tencent.startsWith("hf_") || isGlobalIndex(c.tencent)) {
+    // ⭐ 放行 hkHSI，让 HK50 走腾讯拿到实时分时
+    if (c.tencent.startsWith("hf_") || (isGlobalIndex(c.tencent) && c.tencent !== "hkHSI")) {
       continue;
     }
 
