@@ -235,7 +235,11 @@ async function handleBatchQuery(request, env, ctx) {
 function resolveAsset(rawCode) {
   if (!rawCode) return null;
   const orig = String(rawCode);
-  const text = orig.trim().toUpperCase();
+  let text = orig.trim().toUpperCase();
+  // 兼容：若外部传入带交易所前缀的格式（如 FOREXCOM:NSXUSD），自动剥离前缀
+  if (text.includes(":") && !/^\d{6}\.(SH|SZ|BJ)$/.test(text)) {
+    text = text.split(":").pop().trim();
+  }  
 
   // ---------- 1. 显式 A股 / 港股 / 北交所 ----------
   if (/^(SH|SZ|HK|BJ)\d+$/.test(text)) {
@@ -297,7 +301,7 @@ function resolveAsset(rawCode) {
     "HF_GC":  { yahoo: "GC=F", name: "COMEX黄金", sina: "hf_GC",  cnbc: "@GC.1" },
     "HF_XAU": { yahoo: "XAUUSD=X", name: "伦敦金", sina: "hf_XAU", cnbc: "XAU=" },
     "GC=F":   { yahoo: "GC=F", name: "COMEX黄金", sina: "hf_GC",  cnbc: "@GC.1" },
-    "XAUUSD": { yahoo: "GC=F", name: "黄金", sina: "hf_XAU", cnbc: "XAU=" },
+    "XAUUSD": { yahoo: "XAUUSD=X", name: "伦敦金(现货)", sina: "hf_XAU", cnbc: "XAU=" },
     "XAUUSD=X": { yahoo: "XAUUSD=X", name: "伦敦金", sina: "hf_XAU", cnbc: "XAU=" },
     "XAU":    { yahoo: "GC=F", name: "黄金", sina: "hf_XAU", cnbc: "XAU=" },
     "GOLD":   { yahoo: "GC=F", name: "COMEX黄金", sina: "hf_GC", cnbc: "@GC.1" },
@@ -358,6 +362,55 @@ function resolveAsset(rawCode) {
       orig,
       displayName: text,
       yahoo: text,
+      currency: "USD",
+    };
+  }
+
+
+  // ---------- 3.5 全球股指连续性合约 & 亚太欧交易所现货指数 ----------
+  const GLOBAL_CONTINUOUS_AND_INDEX_MAP = {
+    // 美股 24H 期指连续流（对应 CME/CBOT 主力连续合约）
+    "NSXUSD":  { kind: "commodity", yahoo: "NQ=F",    cnbc: "@NQ.1",  sina: "hf_NQ",        name: "纳斯达克100连续" },
+    "NQ1!":    { kind: "commodity", yahoo: "NQ=F",    cnbc: "@NQ.1",  sina: "hf_NQ",        name: "纳斯达克100连续" },
+    "SPXUSD":  { kind: "commodity", yahoo: "ES=F",    cnbc: "@ES.1",  sina: "hf_ES",        name: "标普500连续" },
+    "ES1!":    { kind: "commodity", yahoo: "ES=F",    cnbc: "@ES.1",  sina: "hf_ES",        name: "标普500连续" },
+    "YMUSD":   { kind: "commodity", yahoo: "YM=F",    cnbc: "@YM.1",  sina: "hf_YM",        name: "道琼斯30连续" },
+    "YM1!":    { kind: "commodity", yahoo: "YM=F",    cnbc: "@YM.1",  sina: "hf_YM",        name: "道琼斯30连续" },
+
+    // 亚太/欧洲连续流
+    "CHINA50": { kind: "commodity", yahoo: "XIN9.FGI",cnbc: null,     sina: "hf_CHA50CFD",  name: "富时中国A50连续", preferSina: true },
+    "HK50":    { kind: "us",        yahoo: "^HSI",    cnbc: ".HSI",   tencent: "hkHSI",     name: "恒生指数连续", isIndex: true },
+    "JP225":   { kind: "commodity", yahoo: "NKD=F",   cnbc: null,     sina: null,           name: "日经225连续" },
+    "GER40":   { kind: "us",        yahoo: "^GDAXI",  cnbc: ".GDAXI", tencent: null,        name: "德国DAX40连续", isIndex: true },
+
+    // 亚太/欧洲交易所现货（非连续）指数
+    "XIN9":    { kind: "us",        yahoo: "XIN9.FGI",cnbc: null,     sina: "hf_CHA50CFD",  name: "富时中国A50指数", isIndex: true },
+    "NKY":     { kind: "us",        yahoo: "^N225",   cnbc: ".N225",  tencent: null,        name: "日经225指数", isIndex: true },
+    "N225":    { kind: "us",        yahoo: "^N225",   cnbc: ".N225",  tencent: null,        name: "日经225指数", isIndex: true },
+    "^N225":   { kind: "us",        yahoo: "^N225",   cnbc: ".N225",  tencent: null,        name: "日经225指数", isIndex: true },
+    "DAX":     { kind: "us",        yahoo: "^GDAXI",  cnbc: ".GDAXI", tencent: null,        name: "德国DAX40指数", isIndex: true },
+    "GDAXI":   { kind: "us",        yahoo: "^GDAXI",  cnbc: ".GDAXI", tencent: null,        name: "德国DAX40指数", isIndex: true },
+    "^GDAXI":  { kind: "us",        yahoo: "^GDAXI",  cnbc: ".GDAXI", tencent: null,        name: "德国DAX40指数", isIndex: true },
+    "KOSPI":   { kind: "us",        yahoo: "^KS11",   cnbc: ".KS11",  tencent: null,        name: "韩国KOSPI综合指数", isIndex: true },
+    "KS11":    { kind: "us",        yahoo: "^KS11",   cnbc: ".KS11",  tencent: null,        name: "韩国KOSPI综合指数", isIndex: true },
+    "^KS11":   { kind: "us",        yahoo: "^KS11",   cnbc: ".KS11",  tencent: null,        name: "韩国KOSPI综合指数", isIndex: true },
+    "NIFTY":   { kind: "us",        yahoo: "^NSEI",   cnbc: ".NSEI",  tencent: null,        name: "印度NIFTY50指数", isIndex: true },
+    "NSEI":    { kind: "us",        yahoo: "^NSEI",   cnbc: ".NSEI",  tencent: null,        name: "印度NIFTY50指数", isIndex: true },
+    "^NSEI":   { kind: "us",        yahoo: "^NSEI",   cnbc: ".NSEI",  tencent: null,        name: "印度NIFTY50指数", isIndex: true },
+  };
+  if (GLOBAL_CONTINUOUS_AND_INDEX_MAP[text]) {
+    const g = GLOBAL_CONTINUOUS_AND_INDEX_MAP[text];
+    return {
+      kind: g.kind,
+      isIndex: !!g.isIndex,
+      orig,
+      displayName: g.name,
+      yahoo: g.yahoo || null,
+      cnbc: g.cnbc || null,
+      sina: g.sina || null,
+      tencent: g.tencent || null,
+      nasdaq: null,
+      preferSina: !!g.preferSina,
       currency: "USD",
     };
   }
@@ -472,7 +525,7 @@ function resolveAsset(rawCode) {
 
 function buildFxAsset(orig, base, quote, sinaOverride = null, yahooOverride = null) {
   const pair = base + quote;
-  const yahoo = yahooOverride || `${pair}=X`;
+  const yahoo = yahooOverride || (pair === "USDCNH" ? "CNH=X" : `${pair}=X`);
   const currency = quote === "CNH" ? "CNY" : quote;
   const cnbcMap = {
     USDCNY: "CNY=",
@@ -570,6 +623,11 @@ function getBondCurrency(country) {
 // 全球资产统一入口：price / intraday / info / movingaveragedata
 // ============================================================
 async function fetchGlobalPrice(asset, env, emBondLoader = null) {
+  // 0) 标记 preferSina 的连续合约（如 CHINA50），优先取新浪 20H 实时期货报价
+  if (asset.preferSina && asset.sina) {
+    const sp = await fetchSinaPrice(asset);
+    if (sp) return sp;
+  }
   // 1) 优先 Yahoo Finance（美股/大宗商品/美元外汇/部分美债指数）
   if (asset.yahoo) {
     const yp = await fetchYahooPrice(asset);
