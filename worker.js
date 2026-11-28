@@ -940,29 +940,65 @@ async function fetchYahooPrice(asset) {
   return parseYahooChartToPrice(asset, raw);
 }
 
+function getNyFxSessionKey(ts) {
+  const { date, time } = formatTsInTz(ts, "America/New_York");
+  if (time >= "17:00:00") {
+    const d = new Date(`${date}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + 1);
+    return d.toISOString().slice(0, 10);
+  }
+  return date;
+}
+
 async function fetchYahooIntraday(asset) {
-  const raw = await fetchYahooChartRaw(asset.yahoo, "1m", "1d");
+  const isFuturesSession = asset.kind === "commodity" || asset.orig === "DXY" || asset.yahoo === "DX-Y.NYB";
+  const isFxSession = asset.kind === "fx" && !isFuturesSession;
+  const range = (isFuturesSession || isFxSession) ? "2d" : "1d";
+
+  const raw = await fetchYahooChartRaw(asset.yahoo, "1m", range);
   if (!raw) return null;
 
   const meta = raw.meta || {};
   const tz = meta.exchangeTimezoneName || "America/New_York";
+  // ⭐ 如希望连续品种弹窗分时也像首页卡片一样显示北京时间，把下面这行改为: const displayTz = (isFuturesSession || isFxSession) ? "Asia/Shanghai" : tz;
+  const displayTz = tz;
+
   const timestamps = raw.timestamp || [];
   const q = raw.indicators?.quote?.[0] || {};
   const closes = q.close || [];
   const opens = q.open || [];
   const volumes = q.volume || [];
 
-  if (!timestamps.length) return null;
-
-  // 仅保留最新一个交易日的数据，确保与国内接口单日分时结构一致
-  let targetDate = null;
-  for (let i = timestamps.length - 1; i >= 0; i--) {
-    if (numOrNull(closes[i]) != null) {
-      targetDate = formatTsInTz(timestamps[i], tz).date;
-      break;
-    }
+  const validPts = [];
+  for (let i = 0; i < timestamps.length; i++) {
+    const price = numOrNull(closes[i]) ?? numOrNull(opens[i]);
+    if (price == null) continue;
+    const vol = Math.max(0, numOrNull(volumes[i]) ?? 0);
+    validPts.push({ ts: timestamps[i], price, vol });
   }
-  if (!targetDate) return null;
+  if (validPts.length === 0) return null;
+
+  // ⭐ 根据资产类型确定当前交易 Session 起点
+  let sessionPts = [];
+  if (isFuturesSession) {
+    // 寻找最近一次 >= 45分钟(2700秒) 的休市跳空（精准命中 17:00-18:00 ET / 周末 / 伦敦休市）
+    let startIdx = 0;
+    for (let i = validPts.length - 1; i >= 1; i--) {
+      if (validPts[i].ts - validPts[i - 1].ts >= 2700) {
+        startIdx = i;
+        break;
+      }
+    }
+    sessionPts = validPts.slice(startIdx);
+  } else if (isFxSession) {
+    // 24H 外汇按纽约 17:00 ET 换日
+    const targetSessionKey = getNyFxSessionKey(validPts[validPts.length - 1].ts);
+    sessionPts = validPts.filter(p => getNyFxSessionKey(p.ts) === targetSessionKey);
+  } else {
+    // 日盘现货/ETF 沿用单日过滤
+    const targetDate = formatTsInTz(validPts[validPts.length - 1].ts, displayTz).date;
+    sessionPts = validPts.filter(p => formatTsInTz(p.ts, displayTz).date === targetDate);
+  }
 
   let cumVol = 0;
   let cumAmt = 0;
@@ -970,17 +1006,11 @@ async function fetchYahooIntraday(asset) {
   let countPrice = 0;
   const rows = [];
 
-  for (let i = 0; i < timestamps.length; i++) {
-    const price = numOrNull(closes[i]) ?? numOrNull(opens[i]);
-    if (price == null) continue;
-
-    const { date, time } = formatTsInTz(timestamps[i], tz);
-    if (date !== targetDate) continue;
-
-    const vol = Math.max(0, numOrNull(volumes[i]) ?? 0);
-    cumVol += vol;
-    cumAmt += price * vol;
-    sumPrice += price;
+  for (const pt of sessionPts) {
+    const { date, time } = formatTsInTz(pt.ts, displayTz);
+    cumVol += pt.vol;
+    cumAmt += pt.price * pt.vol;
+    sumPrice += pt.price;
     countPrice++;
 
     const avgPrice = cumVol > 0
@@ -989,10 +1019,10 @@ async function fetchYahooIntraday(asset) {
 
     rows.push({
       date,
-      time,
-      price,
+      time: (isFuturesSession || isFxSession) ? `${date.slice(5)} ${time.slice(0, 5)}` : time,
+      price: pt.price,
       avg_price: avgPrice,
-      volume: vol,
+      volume: pt.vol,
     });
   }
 
